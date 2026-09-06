@@ -1,5 +1,6 @@
 import { config } from "./config.js";
 import { getCachedInventory, setCachedInventory } from "./db.js";
+import { steamHeaders } from "./steamHeaders.js";
 
 /**
  * Reads a public CS2 inventory from Steam and reduces it to a list of item
@@ -9,7 +10,6 @@ import { getCachedInventory, setCachedInventory } from "./db.js";
 
 const APP_ID = 730;
 const CONTEXT_ID = 2;
-const PAGE_SIZE = 2000;
 
 /** SteamID64 for individual accounts always starts with 7656119 and has 17 digits. */
 const STEAM_ID_PATTERN = /^7656119\d{10}$/;
@@ -46,6 +46,10 @@ export interface InventorySnapshot {
   totalItems: number;
   fetchedAt: number;
   fromCache: boolean;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 /**
@@ -108,7 +112,7 @@ async function fetchPage(
 ): Promise<SteamInventoryPage> {
   const params = new URLSearchParams({
     l: "english",
-    count: String(PAGE_SIZE),
+    count: String(config.inventoryPageSize),
   });
   if (startAssetId) params.set("start_assetid", startAssetId);
 
@@ -118,11 +122,9 @@ async function fetchPage(
   try {
     response = await fetch(url, {
       signal: AbortSignal.timeout(config.outboundTimeoutMs),
-      headers: {
-        "User-Agent": config.userAgent,
-        Accept: "application/json",
-        Referer: `https://steamcommunity.com/profiles/${steamId}/inventory`,
-      },
+      headers: steamHeaders(
+        `https://steamcommunity.com/profiles/${steamId}/inventory`,
+      ),
     });
   } catch (error) {
     throw new InventoryError(
@@ -142,7 +144,8 @@ async function fetchPage(
   if (response.status === 429) {
     throw new InventoryError(
       "steam_rate_limited",
-      "Steam is currently rate limiting this server, try again later",
+      "Steam refused the inventory request with 429. This is usually the " +
+        "client identity rather than the request volume; check STEAM_USER_AGENT.",
       429,
     );
   }
@@ -179,6 +182,9 @@ async function fetchFromSteam(steamId: string): Promise<InventoryItem[]> {
   let startAssetId: string | undefined;
 
   for (let page = 0; page < config.inventoryMaxPages; page++) {
+    // Small pages mean more requests, so they are spaced out deliberately.
+    if (page > 0) await sleep(config.inventoryPageDelayMs);
+
     const data = await fetchPage(steamId, startAssetId);
 
     const descriptions = new Map<string, SteamDescription>();

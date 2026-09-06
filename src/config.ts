@@ -106,7 +106,16 @@ export const config = {
   steamFallbackMaxPerRequest: num("STEAM_FALLBACK_MAX_PER_REQUEST", 15),
 
   inventoryCacheMinutes: num("INVENTORY_CACHE_MINUTES", 10),
-  inventoryMaxPages: num("INVENTORY_MAX_PAGES", 5),
+  /**
+   * Items per inventory page. Steam scales its rate limit with this value and
+   * rejects large pages outright for anonymous callers, so this stays close to
+   * what the community site itself requests.
+   */
+  inventoryPageSize: num("INVENTORY_PAGE_SIZE", 75),
+  /** Safety limit on pagination: page size times this is the item ceiling. */
+  inventoryMaxPages: num("INVENTORY_MAX_PAGES", 40),
+  /** Pause between inventory pages, so paging does not look like a burst. */
+  inventoryPageDelayMs: num("INVENTORY_PAGE_DELAY_MS", 2000),
 
   /**
    * Applied before authentication, so wrong keys and the open health endpoint
@@ -123,7 +132,20 @@ export const config = {
 
   /** Shared by every outbound HTTP call so a hanging peer cannot stall a request. */
   outboundTimeoutMs: 30_000,
-  /** Steam rejects requests without a plausible browser user agent. */
-  userAgent:
+
+  /**
+   * Steam answers 429 to clients it does not recognise, so requests present a
+   * consistent browser identity (see steamHeaders.ts). Both values belong
+   * together: the client hint has to name the same major version as the user
+   * agent, otherwise the pair looks forged. Bump them when Steam starts
+   * refusing this combination.
+   */
+  steamUserAgent: str(
+    "STEAM_USER_AGENT",
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+  ),
+  steamSecChUa: str(
+    "STEAM_SEC_CH_UA",
+    '"Chromium";v="124", "Google Chrome";v="124"',
+  ),
 } as const;

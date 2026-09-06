@@ -1,4 +1,5 @@
 import { config } from "./../config.js";
+import { steamHeaders } from "./../steamHeaders.js";
 
 /**
  * Direct lookup against Steam's own market endpoint. Used only for items the
@@ -64,10 +65,7 @@ async function requestPrice(
 
   const response = await fetch(url, {
     signal: AbortSignal.timeout(config.outboundTimeoutMs),
-    headers: {
-      "User-Agent": config.userAgent,
-      Accept: "application/json",
-    },
+    headers: steamHeaders("https://steamcommunity.com/market/"),
   });
 
   if (response.status === 429) {
