@@ -58,6 +58,31 @@ function parseGuestKeys(raw: string): Map<string, string> {
   return keys;
 }
 
+/**
+ * Same shape as parseGuestKeys, but for the codes a person types into the web
+ * frontend. Twelve characters instead of twenty four because these are meant to
+ * be readable and typed by hand; the login endpoint carries its own strict rate
+ * limit to make up for the smaller search space. See the security section of
+ * the README before lowering this further.
+ */
+function parseAccessCodes(raw: string): Map<string, string> {
+  const codes = new Map<string, string>();
+  for (const entry of raw.split(",")) {
+    const trimmed = entry.trim();
+    if (!trimmed) continue;
+    const separator = trimmed.indexOf(":");
+    const code = separator === -1 ? trimmed : trimmed.slice(0, separator);
+    const label = separator === -1 ? "unnamed" : trimmed.slice(separator + 1);
+    if (code.length < 12) {
+      throw new Error(
+        `Access code "${label}" is shorter than 12 characters and would be guessable`,
+      );
+    }
+    codes.set(code, label || "unnamed");
+  }
+  return codes;
+}
+
 const dataDir = path.resolve(str("DATA_DIR", "./data"));
 fs.mkdirSync(dataDir, { recursive: true });
 
@@ -73,6 +98,23 @@ if (currency !== "EUR" && currency !== "USD") {
   throw new Error("CURRENCY must be either EUR or USD");
 }
 
+/**
+ * The Steam library and HowLongToBeat features are optional: without a Web API
+ * key the routes answer 503 and everything else keeps working. That way an
+ * existing deployment still starts after an update without new configuration.
+ */
+const steamApiKey = str("STEAM_API_KEY", "");
+
+const accessCodes = parseAccessCodes(str("ACCESS_CODES", ""));
+const sessionSecret = str("SESSION_SECRET", "");
+// Codes without a secret would hand out cookies nobody can verify, so this
+// combination is a configuration error rather than a disabled feature.
+if (accessCodes.size > 0 && sessionSecret.length < 32) {
+  throw new Error(
+    "ACCESS_CODES requires SESSION_SECRET with at least 32 characters (openssl rand -hex 32)",
+  );
+}
+
 export const config = {
   host: str("HOST", "127.0.0.1"),
   port: num("PORT", 8087),
@@ -80,6 +122,13 @@ export const config = {
 
   adminKey,
   guestKeys: parseGuestKeys(str("GUEST_KEYS", "")),
+
+  accessCodes,
+  sessionSecret,
+  sessionTtlDays: num("SESSION_TTL_DAYS", 30),
+  cookieName: str("COOKIE_NAME", "sxo_session"),
+  /** Only ever false for local development over plain http. */
+  cookieSecure: bool("COOKIE_SECURE", true),
 
   dataDir,
   dbPath: path.join(dataDir, "prices.sqlite"),
@@ -130,6 +179,17 @@ export const config = {
   adminRateWindowMs: num("ADMIN_RATE_WINDOW_MINUTES", 10) * 60_000,
   adminRateMax: num("ADMIN_RATE_MAX", 200),
 
+  /**
+   * The login endpoint is the one place where a short secret is guessed against,
+   * so it gets a far tighter budget than the rest, keyed on the client address.
+   */
+  loginRateWindowMs: num("LOGIN_RATE_WINDOW_MINUTES", 15) * 60_000,
+  loginRateMax: num("LOGIN_RATE_MAX", 10),
+
+  /** Sessions get their own budget: browsing a library is many small requests. */
+  sessionRateWindowMs: num("SESSION_RATE_WINDOW_MINUTES", 10) * 60_000,
+  sessionRateMax: num("SESSION_RATE_MAX", 120),
+
   /** Shared by every outbound HTTP call so a hanging peer cannot stall a request. */
   outboundTimeoutMs: 30_000,
 
@@ -148,4 +208,33 @@ export const config = {
     "STEAM_SEC_CH_UA",
     '"Chromium";v="124", "Google Chrome";v="124"',
   ),
+
+  // --- Steam library -----------------------------------------------------
+  steamApiKey,
+  /** A library changes far less often than a price, so it is cached longer. */
+  libraryCacheMinutes: num("LIBRARY_CACHE_MINUTES", 60),
+  profileCacheMinutes: num("PROFILE_CACHE_MINUTES", 60),
+  vanityCacheHours: num("VANITY_CACHE_HOURS", 24),
+  /**
+   * Capsule images come straight from Steam's CDN. Kept configurable because
+   * Steam has moved this host twice and a broken image is otherwise a redeploy.
+   */
+  steamCapsuleBase: str(
+    "STEAM_CAPSULE_BASE",
+    "https://shared.fastly.steamstatic.com/store_item_assets/steam/apps",
+  ),
+
+  // --- HowLongToBeat -----------------------------------------------------
+  /** Emergency switch, for when HowLongToBeat closes the door on scraping. */
+  hltbEnabled: bool("HLTB_ENABLED", true),
+  hltbWorkerIntervalMinutes: num("HLTB_WORKER_INTERVAL_MINUTES", 2),
+  /** Lookups per cycle. Batch times delay should stay under the interval. */
+  hltbBatchSize: num("HLTB_BATCH_SIZE", 40),
+  hltbDelayMs: num("HLTB_DELAY_MS", 3000),
+  /** Completion times are effectively static, so they are refreshed rarely. */
+  hltbMaxAgeDays: num("HLTB_MAX_AGE_DAYS", 90),
+  /** A game with no match is retried eventually, in case it gets added later. */
+  hltbUnmatchedRetryDays: num("HLTB_UNMATCHED_RETRY_DAYS", 30),
+  /** How long a discovered search token is reused before being fetched again. */
+  hltbTokenTtlMinutes: num("HLTB_TOKEN_TTL_MINUTES", 30),
 } as const;

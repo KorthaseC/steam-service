@@ -1,8 +1,19 @@
 # CS Price Service
 
-A self-hosted HTTP API that values public CS2 Steam inventories and serves
-current Steam Market prices from a local cache. Ships with an example Google
-Apps Script client so a spreadsheet can pull live prices into a buy/sell log.
+A self-hosted HTTP API around public Steam data. Two feature sets share one
+process, one database and one deployment:
+
+- **Inventory valuation** — values public CS2 inventories against current Steam
+  Market prices from a local cache. Ships with an example Google Apps Script
+  client so a spreadsheet can pull live prices into a buy/sell log.
+- **Library and completion times** — resolves a Steam profile, lists the games
+  it owns, and matches them against HowLongToBeat, so the question *"I have
+  eight hours, which of my games can I actually finish?"* has an answer. This is
+  the backend for the Steam Expander Overviewer web frontend, which lives in its
+  own repository.
+
+They share the demand-driven caching approach described below, and either can be
+switched off through configuration without touching the other.
 
 - **Runtime:** Node.js 20+ (tested on 22), TypeScript, Express
 - **Storage:** SQLite (`better-sqlite3`), a single file, no external database
@@ -53,6 +64,59 @@ never gets unpacked.
 the client hint has to name the same major version as the user agent. If Steam
 starts refusing the pair, bump both.
 
+## Steam libraries and completion times
+
+Reading a library needs the official Web API (`STEAM_API_KEY`): resolving a
+vanity name, reading a profile and listing owned games all require a key, and
+none of those endpoints send CORS headers, which is the whole reason a browser
+frontend needs this server at all.
+
+Completion times come from **HowLongToBeat, which has no public API**. What this
+does instead is what their own web app does, verified against the live site:
+
+1. `GET /api/search/site/init` returns `{ token, hpKey, hpVal }`.
+2. `POST /api/search/site` sends that token as `x-auth-token`, the `hpKey` and
+   `hpVal` pair as *both* headers and a field inside the JSON body — sending it
+   in only one of the two places is rejected — and gets back search results.
+3. A `403` means the token expired: fetch a new one and retry once.
+
+The token encodes the caller's IP address **and** User-Agent, so the init call
+and the search using it have to present the same `User-Agent` header.
+
+This is scraping and it will break. All of it lives in
+`src/sources/howLongToBeat.ts`, `HLTB_ENABLED=false` turns it off without a
+deploy, and a failure degrades to "no completion times" rather than to a failed
+request for the whole library.
+
+### Matching a Steam game to a HowLongToBeat entry
+
+Getting this wrong is silent — a mismatched game shows plausible but wrong
+times. Matching therefore runs cheapest-first and only escalates when unsure:
+
+1. Exact comparison of normalised titles, against the title and HLTB's alias
+   field. Normalising folds accents, spells out `&`, drops punctuation, and
+   strips `™`/`®` **before** Unicode normalisation, which would otherwise expand
+   `™` into the letters `TM` and turn `PAYDAY™ 2` into `paydaytm 2`.
+2. The same comparison with edition wording removed, since Steam writes
+   *Skyrim Special Edition* where HowLongToBeat writes *Skyrim*. Only a second
+   attempt, because *Remastered* can be a genuinely separate entry.
+3. Still ambiguous: fetch the candidate's detail page and compare its
+   `profile_steam` field against the Steam AppID. That is authoritative. Capped
+   at two candidates so an unmatchable library cannot triple the request volume.
+
+In practice nearly everything resolves at step 1 for a single request per game.
+A game that resolves to nothing is cached as *unmatched* — remembering the miss
+is what stops a library full of multiplayer titles from being searched forever.
+
+### Why the times arrive late
+
+A library of several hundred games cannot be resolved inside one request:
+throttled lookups would take far longer than any sensible timeout. So the
+library endpoint answers immediately with `hltb: null` for anything uncached,
+records those games, and a background worker fills them in — the same
+demand-driven shape as pricing. The frontend polls until nothing is pending.
+At the default settings a 500-game library completes in roughly 25 minutes.
+
 ## How a request flows
 
 ```
@@ -71,6 +135,23 @@ GET /api/inventory/:steamId
   |- JSON response
 ```
 
+```
+GET /api/steam/library/:ref
+  |- rate limit  per client address, pre-auth
+  |- auth        bearer key, else signed session cookie -> guest level
+  |- rate limit  per key or session label
+  |- parse       :ref -> SteamID64 or vanity name, anything else refused
+  |- resolve     vanity -> SteamID64 via the Web API, cached both ways
+  |              (a remembered miss stops a typo hitting Steam every reload)
+  |- profile     SQLite cache hit? -> use it, otherwise GetPlayerSummaries
+  |              private profile -> 403 before any library call happens
+  |- library     SQLite cache hit? -> use it, otherwise GetOwnedGames
+  |- tracking    every AppID is recorded for the completion-time worker
+  |- times       bulk SELECT from hltb_games; unknown games stay null
+  |- kick        worker started in the background if anything is pending
+  |- JSON response, immediately
+```
+
 ## Installation
 
 ```bash
@@ -83,7 +164,12 @@ npm run build
 cp .env.example .env
 openssl rand -hex 32        # -> ADMIN_KEY
 openssl rand -hex 24        # -> one GUEST_KEY per person
+openssl rand -hex 32        # -> SESSION_SECRET, if you run the web frontend
 $EDITOR .env
+
+# For the library features, add a Steam Web API key from
+# https://steamcommunity.com/dev/apikey  ->  STEAM_API_KEY
+# and one ACCESS_CODES entry per person who should reach the frontend.
 
 # Seed the tracking list from your own inventory and price it. The first pass
 # takes a few minutes; it can be re-run safely and picks up where it stopped.
@@ -132,6 +218,26 @@ you put in front of the service has to:
 - optionally return 404 for anything outside `/api/*`, which drops scanner
   traffic before it reaches the application
 
+If you also serve the web frontend, serve it from the **same origin** — the
+static build at `/`, this service at `/api/*`. That is what the session cookie
+assumes, and it means no CORS configuration exists anywhere. Replace the
+"404 outside `/api/*`" rule with a file server plus an SPA fallback:
+
+```caddy
+handle /api/* {
+    reverse_proxy 127.0.0.1:8087
+}
+handle {
+    root * /var/www/steam-expander/browser
+    try_files {path} /index.html
+    file_server
+}
+```
+
+For local frontend development, do not add CORS — point the Angular dev server's
+`proxyConfig` at `http://localhost:8087` so it stays same-origin, and run the
+backend with `COOKIE_SECURE=false`. `docs/backend-contract.md` has the config.
+
 ## Configuration
 
 Every option is set through the environment; `.env.example` documents all of
@@ -158,9 +264,27 @@ them. The ones you are most likely to change:
 | `IP_RATE_MAX`                    | `300`      | Requests per address before auth. Keep above per-key limits.     |
 | `GUEST_RATE_MAX`                 | `20`       | Guest requests per rate-limit window.                            |
 | `ENABLE_HISTORY`                 | `true`     | Store one price point per item per day.                          |
+| `STEAM_API_KEY`                  | empty      | Web API key. Empty disables the library endpoints (503).         |
+| `ACCESS_CODES`                   | empty      | `code:label,…` for the frontend login. Each >= 12 characters.    |
+| `SESSION_SECRET`                 | empty      | Cookie signing key, >= 32 characters. Required with access codes.|
+| `SESSION_TTL_DAYS`               | `30`       | Cookie lifetime.                                                 |
+| `COOKIE_SECURE`                  | `true`     | Only false for local development over plain http.                |
+| `LOGIN_RATE_MAX`                 | `10`       | Login attempts per address per 15 minutes.                       |
+| `SESSION_RATE_MAX`               | `120`      | Requests per signed-in browser per window.                       |
+| `LIBRARY_CACHE_MINUTES`          | `60`       | Libraries change slowly; this saves Web API calls.               |
+| `HLTB_ENABLED`                   | `true`     | Emergency switch for all HowLongToBeat traffic.                  |
+| `HLTB_BATCH_SIZE`                | `40`       | Games per worker cycle. Batch × delay should fit the interval.   |
+| `HLTB_DELAY_MS`                  | `3000`     | Delay between HowLongToBeat requests.                            |
+| `HLTB_MAX_AGE_DAYS`              | `90`       | Completion times barely change.                                  |
 
 Invalid or missing critical values abort startup rather than failing later at
-request time.
+request time. Two exceptions are deliberate: `STEAM_API_KEY` and
+`ACCESS_CODES`/`SESSION_SECRET` may be absent, in which case the corresponding
+endpoints answer `503 feature_disabled` and everything else keeps working — so
+an existing deployment still boots after an update without new configuration.
+Setting `ACCESS_CODES` *without* a long `SESSION_SECRET` is a configuration
+error and does abort startup, because it would hand out cookies nobody can
+verify.
 
 ## API
 
@@ -168,14 +292,27 @@ Authentication: `Authorization: Bearer <key>`. A `?key=<key>` query parameter is
 accepted as a fallback for clients that cannot send headers — see the note under
 _Security model_ first.
 
-| Method | Path                        | Access | Purpose                                        |
-| ------ | --------------------------- | ------ | ---------------------------------------------- |
-| GET    | `/api/health`               | open   | Liveness and cache state                       |
-| GET    | `/api/inventory/:steamId`   | guest  | Value a public inventory                       |
-| GET    | `/api/portfolio/:steamId`   | admin  | Same data, plus `?format=csv` and `?refresh=1` |
-| POST   | `/api/prices/lookup`        | admin  | Prices for a list of names (max 500)           |
-| POST   | `/api/admin/refresh-prices` | admin  | Run a refresh cycle now                        |
-| GET    | `/api/admin/status`         | admin  | Cache, tracking and queue state                |
+The browser frontend authenticates differently — see _Sessions_ below.
+
+| Method | Path                            | Access  | Purpose                                        |
+| ------ | ------------------------------- | ------- | ---------------------------------------------- |
+| GET    | `/api/health`                   | open    | Liveness and cache state                       |
+| GET    | `/api/inventory/:steamId`       | guest   | Value a public inventory                       |
+| GET    | `/api/portfolio/:steamId`       | admin   | Same data, plus `?format=csv` and `?refresh=1` |
+| POST   | `/api/prices/lookup`            | admin   | Prices for a list of names (max 500)           |
+| POST   | `/api/admin/refresh-prices`     | admin   | Run a refresh cycle now                        |
+| GET    | `/api/admin/status`             | admin   | Cache, tracking and queue state                |
+| POST   | `/api/auth/session`             | open    | Trade an access code for a session cookie      |
+| GET    | `/api/auth/session`             | open    | Whether the caller is signed in                |
+| DELETE | `/api/auth/session`             | open    | Sign out                                       |
+| GET    | `/api/steam/library/:ref`       | guest   | Profile, owned games, cached completion times  |
+| GET    | `/api/steam/library/:ref/hltb`  | guest   | Completion times only, for polling             |
+| GET    | `/api/steam/status`             | admin   | Completion-time worker progress                |
+| POST   | `/api/admin/refresh-hltb`       | admin   | Run a completion-time cycle now                |
+
+`docs/backend-contract.md` documents the library endpoints in full — request
+shapes, response shapes, error codes and polling behaviour. That file is the one
+to hand to the frontend.
 
 ```bash
 curl -H "Authorization: Bearer $GUEST_KEY" \
@@ -229,7 +366,36 @@ price.
 
 Error codes: `invalid_steamid`, `inventory_private`, `inventory_empty`,
 `steam_rate_limited`, `steam_unavailable`, `rate_limited`, `missing_api_key`,
-`invalid_api_key`, `admin_key_required`, `invalid_body`, `too_many_names`.
+`invalid_api_key`, `admin_key_required`, `invalid_body`, `too_many_names`,
+`invalid_steam_ref`, `vanity_not_found`, `profile_not_found`, `profile_private`,
+`library_unavailable`, `invalid_session`, `invalid_access_code`,
+`feature_disabled`.
+
+`library_unavailable` deserves a friendly message in any client: it means the
+profile is public but its **game details** are private, which is a separate
+Steam privacy setting and defaults to private for many accounts.
+
+### Sessions
+
+The web frontend cannot hold a bearer key — anything a page stores is readable
+by script on that page, and a stolen key would be permanent. Instead a person
+types an access code once and receives a signed `HttpOnly` cookie:
+
+```bash
+curl -c jar -X POST https://prices.example.com/api/auth/session \
+  -H 'Content-Type: application/json' -d '{"code":"the-access-code"}'
+
+curl -b jar https://prices.example.com/api/steam/library/gaben
+```
+
+A session counts as guest access, so it also opens `/api/inventory/:steamId` —
+which is what makes it cheap to show inventory values in the frontend later.
+Admin endpoints are bearer-only and a cookie never reaches them.
+
+The cookie is self-contained: it carries its own expiry inside the signature, so
+there is no session table. The flip side is that individual sessions cannot be
+revoked — rotating `SESSION_SECRET` signs everybody out at once, and that is the
+intended lever.
 
 ## Security model
 
@@ -242,9 +408,28 @@ Error codes: `invalid_steamid`, `inventory_private`, `inventory_empty`,
   person means deleting one entry and restarting. Labels double as rate-limit
   buckets, so give each entry a distinct one.
 - **Constant-time key comparison**, so response timing does not reveal how many
-  leading characters of a guessed key were correct.
+  leading characters of a guessed key were correct. Access codes are compared
+  against every entry rather than exiting early, for the same reason.
+- **Session cookies are `HttpOnly`**, so no script on the page can read one,
+  `SameSite=Lax`, and scoped to `Path=/api` so they are never sent with requests
+  for static frontend assets. They are signed with HMAC-SHA256 and carry their
+  own expiry inside the signature.
+- **Access codes are shorter than guest keys** — 12 characters against 24 —
+  because a person types them. That is a real trade-off, paid for by a dedicated
+  login limiter of 10 attempts per 15 minutes per address, applied *before* the
+  comparison. If you expose this to the open internet rather than to a handful
+  of friends, raise the minimum in `parseAccessCodes` and issue longer codes.
+- **Cookies never reach admin endpoints.** `requireAdmin` reads bearer keys
+  only, so even a mistake in the cookie handling cannot escalate a session into
+  administrative access.
 - **No SSRF surface.** SteamIDs are validated against `^7656119\d{10}$` before
-  anything happens. No parameter lets a caller influence a URL, host or path.
+  anything happens, and the `:ref` path segment is re-parsed server-side by
+  `parseSteamRef` — a value that is not a SteamID64, a `steamcommunity.com`
+  profile link or a plain vanity name is refused rather than forwarded. No
+  parameter lets a caller influence a URL, host or path.
+- **The Steam Web API key never appears in a log line or an error message**, and
+  URLs are built through `URLSearchParams` so no caller-supplied string is
+  interpolated next to it.
 - **Two-stage rate limiting.** An address-based limiter runs _before_
   authentication, so wrong keys and the open health endpoint are bounded too;
   per-key limiters then apply separately for guest and admin. IPv6 clients are
@@ -302,6 +487,19 @@ listed after each run.
 - The inventory must be public, otherwise Steam answers `inventory_private`.
 - A request needing many direct lookups can take a minute or more
   (`STEAM_FALLBACK_MAX_PER_REQUEST` × `STEAM_FALLBACK_DELAY_MS`).
+- Completion times arrive gradually, not with the first response. A 500-game
+  library takes roughly 25 minutes to fill at the default worker settings.
+- The HowLongToBeat client is scraping an undocumented endpoint. It is expected
+  to break at some point; when it does, libraries still load and completion
+  times simply stay `null`. Check `GET /api/steam/status` and the logs.
+- Matching is by title, confirmed by Steam AppID only when the title is
+  ambiguous. A game whose Steam and HowLongToBeat names differ in an unusual way
+  can end up unmatched rather than wrong, which is the intended failure
+  direction.
+- Reading a library needs the account's **game details** to be public, which is
+  a different Steam setting from the profile being public.
+- The Steam Web API allows 100,000 calls per day per key. Libraries are cached
+  for an hour, so this is not a practical limit for a handful of users.
 
 ## Project layout
 
@@ -309,20 +507,40 @@ listed after each run.
 src/
   server.ts            Express app, middleware, timers, graceful shutdown
   routes.ts            All HTTP endpoints and rate limiters
-  auth.ts              Key extraction, constant-time verification, levels
+  auth.ts              Key extraction, session lookup, access levels
+  session.ts           Signed HttpOnly session cookies, cookie parsing
   config.ts            Environment parsing and validation
-  db.ts                SQLite schema, prepared statements, tracking queue
+  db.ts                SQLite schema, prepared statements, tracking queues
+  throttle.ts          Serialised request queue with a circuit breaker
   prices.ts            Price cache: refresh cycle, lookups, fee maths
-  steamHeaders.ts      The client identity every Steam request sends
+  hltb.ts              Completion-time cache: refresh cycle and worker
+  steamHeaders.ts      The client identity every steamcommunity request sends
   steamInventory.ts    Inventory fetch, pagination, aggregation, cache
+  steamLibrary.ts      Profile + owned games + cached times, and the caches
+  steamRef.ts          Parses user input into a SteamID64 or vanity name
   valuation.ts         Inventory x prices -> totals, plus CSV output
   cli-refresh.ts       Seed and refresh from the command line
   sources/
     steamMarket.ts     Throttled priceoverview lookups
+    steamWebApi.ts     ResolveVanityURL, GetPlayerSummaries, GetOwnedGames
+    howLongToBeat.ts   Token flow, search, and title matching
+  *.test.ts            Unit tests for the pure parts (node:test)
 apps-script/Code.gs    Example Google Sheets client
 deploy/                systemd unit
-docs/guests.md         Handout for people you give a guest key to
+docs/backend-contract.md  Endpoint contract for the web frontend
+docs/guests.md            Handout for people you give access to
 ```
+
+## Tests
+
+```bash
+npm test        # node:test via tsx, no extra dependency
+npm run typecheck
+```
+
+Covered: the input parser, session cookie signing and verification, and title
+normalisation — the pure parts, where a mistake is silent. Network code is not
+covered, which matches how the rest of this project is verified: by running it.
 
 ## License
 

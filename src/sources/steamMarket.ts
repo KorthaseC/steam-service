@@ -1,5 +1,6 @@
 import { config } from "./../config.js";
 import { steamHeaders } from "./../steamHeaders.js";
+import { createThrottledQueue } from "./../throttle.js";
 
 /**
  * Direct lookup against Steam's own market endpoint. Used only for items the
@@ -13,14 +14,12 @@ import { steamHeaders } from "./../steamHeaders.js";
 const CURRENCY_CODES: Record<string, number> = { USD: 1, EUR: 3 };
 const APP_ID = 730;
 
-/** Timestamp until which Steam is not contacted again after a 429. */
-let blockedUntil = 0;
-/** Tail of the promise chain that serialises all outgoing lookups. */
-let queue: Promise<unknown> = Promise.resolve();
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
+const queue = createThrottledQueue({
+  label: "steam-market",
+  delayMs: config.steamFallbackDelayMs,
+  // Steam blocks the whole IP, not just the item that tripped the limit.
+  blockMs: 5 * 60_000,
+});
 
 /**
  * Turns a localised Steam price string such as "1.234,56€" or "$12.34" into a
@@ -55,8 +54,6 @@ interface PriceOverviewResponse {
 async function requestPrice(
   marketHashName: string,
 ): Promise<number | undefined> {
-  if (Date.now() < blockedUntil) return undefined;
-
   const currencyCode = CURRENCY_CODES[config.currency] ?? 3;
   const url =
     `https://steamcommunity.com/market/priceoverview/` +
@@ -69,11 +66,7 @@ async function requestPrice(
   });
 
   if (response.status === 429) {
-    // Back off for five minutes; Steam blocks the whole IP, not just this item.
-    blockedUntil = Date.now() + 5 * 60_000;
-    console.warn(
-      "[steam-market] rate limited, pausing direct lookups for 5 minutes",
-    );
+    queue.block();
     return undefined;
   }
   if (!response.ok) return undefined;
@@ -94,24 +87,9 @@ async function requestPrice(
 export function lookupSteamPrice(
   marketHashName: string,
 ): Promise<number | undefined> {
-  const task = queue.then(async () => {
-    try {
-      const price = await requestPrice(marketHashName);
-      await sleep(config.steamFallbackDelayMs);
-      return price;
-    } catch (error) {
-      console.warn(
-        `[steam-market] lookup failed for ${marketHashName}: ${(error as Error).message}`,
-      );
-      await sleep(config.steamFallbackDelayMs);
-      return undefined;
-    }
-  });
-  // Keep the chain alive even if a task rejects.
-  queue = task.catch(() => undefined);
-  return task;
+  return queue.run(() => requestPrice(marketHashName));
 }
 
 export function isSteamLookupBlocked(): boolean {
-  return Date.now() < blockedUntil;
+  return queue.isBlocked();
 }

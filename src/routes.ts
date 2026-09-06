@@ -5,15 +5,22 @@ import {
   rateLimitKey,
   requireAdmin,
   requireGuest,
+  resolveAccessCode,
+  resolveSessionAuth,
 } from "./auth.js";
 import { config } from "./config.js";
+import { hltbStatus, refreshHltb } from "./hltb.js";
 import {
   netAfterFee,
   priceStoreStatus,
   refreshPrices,
   resolvePrices,
 } from "./prices.js";
+import { sessionCookie, signSession } from "./session.js";
+import { SteamApiError } from "./sources/steamWebApi.js";
 import { getInventory, InventoryError } from "./steamInventory.js";
+import { loadHltbProgress, loadLibrary } from "./steamLibrary.js";
+import { parseSteamRef } from "./steamRef.js";
 import { toCsv, valueInventory } from "./valuation.js";
 
 /**
@@ -58,6 +65,33 @@ const adminLimiter = rateLimit({
   message: { error: "rate_limited" },
 });
 
+/**
+ * Guards the one endpoint where a short, human typed secret is guessed against.
+ * Keyed on the client address because there is no authenticated identity yet.
+ */
+const loginLimiter = rateLimit({
+  windowMs: config.loginRateWindowMs,
+  limit: config.loginRateMax,
+  standardHeaders: "draft-7",
+  legacyHeaders: false,
+  keyGenerator: (req) => clientIpKey(req.ip),
+  message: { error: "rate_limited" },
+});
+
+/**
+ * Budget for the browser frontend. Larger than the guest limit because loading
+ * one library plus polling for completion times is many small requests, not the
+ * single heavy call a spreadsheet client makes.
+ */
+const libraryLimiter = rateLimit({
+  windowMs: config.sessionRateWindowMs,
+  limit: config.sessionRateMax,
+  standardHeaders: "draft-7",
+  legacyHeaders: false,
+  keyGenerator: rateLimitKey,
+  message: { error: "rate_limited" },
+});
+
 /** Translates the typed inventory errors into HTTP responses. */
 function handleInventoryError(error: unknown): {
   status: number;
@@ -72,6 +106,24 @@ function handleInventoryError(error: unknown): {
   console.error("[routes] unexpected error:", error);
   return { status: 500, body: { error: "internal_error" } };
 }
+
+/** Same, for the Steam Web API errors behind the library endpoints. */
+function handleSteamError(error: unknown): { status: number; body: object } {
+  if (error instanceof SteamApiError) {
+    return {
+      status: error.status,
+      body: { error: error.code, message: error.message },
+    };
+  }
+  console.error("[routes] unexpected error:", error);
+  return { status: 500, body: { error: "internal_error" } };
+}
+
+const INVALID_REF = {
+  error: "invalid_steam_ref",
+  message:
+    "Expected a SteamID64, a steamcommunity.com profile link or a vanity name",
+};
 
 /** Public liveness probe. Deliberately reveals nothing beyond service state. */
 router.get("/health", (_req, res) => {
@@ -228,6 +280,152 @@ router.post(
     }
   },
 );
+
+/* ---------------------------------------------------------------------- *
+ * Sessions for the web frontend
+ *
+ * The frontend cannot hold a bearer key: anything it stores is readable by
+ * script on the page. Instead an access code is traded once for an HttpOnly
+ * cookie that no script can read. See session.ts for the cookie format.
+ * ---------------------------------------------------------------------- */
+
+/** Signs in with an access code and returns the session as a cookie. */
+router.post("/auth/session", loginLimiter, (req, res) => {
+  if (config.accessCodes.size === 0 || !config.sessionSecret) {
+    res.status(503).json({
+      error: "feature_disabled",
+      message: "No access codes are configured",
+    });
+    return;
+  }
+
+  const body = req.body as { code?: unknown };
+  if (typeof body?.code !== "string" || body.code.length === 0) {
+    res
+      .status(400)
+      .json({ error: "invalid_body", message: "Expected { code: string }" });
+    return;
+  }
+  // Bounded before the comparison so a huge body cannot become the workload.
+  if (body.code.length > 200) {
+    res.status(403).json({ error: "invalid_access_code" });
+    return;
+  }
+
+  const label = resolveAccessCode(body.code);
+  if (!label) {
+    res.status(403).json({ error: "invalid_access_code" });
+    return;
+  }
+
+  const ttlMs = config.sessionTtlDays * 24 * 60 * 60 * 1000;
+  res.setHeader(
+    "Set-Cookie",
+    sessionCookie(signSession(label, ttlMs), Math.floor(ttlMs / 1000)),
+  );
+  res.json({ ok: true, label });
+});
+
+/** Reports whether the caller currently holds a valid session. */
+router.get("/auth/session", (req, res) => {
+  const session = resolveSessionAuth(req);
+  res.json({
+    authenticated: session !== undefined,
+    // Strip the prefix the auth layer adds for its own bookkeeping.
+    label: session ? session.label.replace(/^session:/, "") : null,
+    loginRequired: config.accessCodes.size > 0,
+  });
+});
+
+/** Signs out by overwriting the cookie with an expired one. */
+router.delete("/auth/session", (_req, res) => {
+  res.setHeader("Set-Cookie", sessionCookie("", 0));
+  res.json({ ok: true });
+});
+
+/* ---------------------------------------------------------------------- *
+ * Steam library and completion times
+ * ---------------------------------------------------------------------- */
+
+/**
+ * Profile, owned games and whatever completion times are already cached.
+ *
+ * Answers immediately: games nobody has looked up yet come back with a null
+ * hltb field and are queued for the background worker. The companion endpoint
+ * below is what the frontend polls until nothing is pending.
+ */
+router.get(
+  "/steam/library/:ref",
+  requireGuest,
+  libraryLimiter,
+  async (req, res) => {
+    // noUncheckedIndexedAccess types route params as possibly undefined; the
+    // raw text is echoed back so the frontend can show what the user typed.
+    const raw = req.params.ref ?? "";
+    const ref = parseSteamRef(raw);
+    if (!ref) {
+      res.status(400).json(INVALID_REF);
+      return;
+    }
+
+    try {
+      res.json(await loadLibrary(ref, raw));
+    } catch (error) {
+      const { status, body } = handleSteamError(error);
+      res.status(status).json(body);
+    }
+  },
+);
+
+/**
+ * Completion times only, keyed by AppID. Reads the cached library rather than
+ * Steam, so polling this every few seconds costs one local query.
+ */
+router.get(
+  "/steam/library/:ref/hltb",
+  requireGuest,
+  libraryLimiter,
+  async (req, res) => {
+    const ref = parseSteamRef(req.params.ref);
+    if (!ref) {
+      res.status(400).json(INVALID_REF);
+      return;
+    }
+
+    try {
+      res.json(await loadHltbProgress(ref));
+    } catch (error) {
+      const { status, body } = handleSteamError(error);
+      res.status(status).json(body);
+    }
+  },
+);
+
+/** Progress of the completion time worker. */
+router.get("/steam/status", requireAdmin, adminLimiter, (_req, res) => {
+  const status = hltbStatus();
+  res.json({
+    ...status,
+    lastRefresh: status.lastRefresh
+      ? new Date(status.lastRefresh).toISOString()
+      : null,
+    steamApiConfigured: config.steamApiKey.length > 0,
+    accessCodes: [...config.accessCodes.values()],
+    workerIntervalMinutes: config.hltbWorkerIntervalMinutes,
+  });
+});
+
+/** Forces a completion time cycle outside the normal schedule. */
+router.post("/admin/refresh-hltb", requireAdmin, adminLimiter, async (_req, res) => {
+  try {
+    const result = await refreshHltb();
+    res.json({ ok: true, ...result });
+  } catch (error) {
+    res
+      .status(502)
+      .json({ error: "refresh_failed", message: (error as Error).message });
+  }
+});
 
 /** Detailed store status, including the list of configured guest key labels. */
 router.get("/admin/status", requireAdmin, adminLimiter, (_req, res) => {

@@ -1,14 +1,21 @@
 import crypto from "node:crypto";
 import type { NextFunction, Request, Response } from "express";
 import { config } from "./config.js";
+import { parseCookies, verifySession } from "./session.js";
 
 /**
  * Two access levels:
- *   guest - may value a public inventory, nothing else
+ *   guest - may value a public inventory and read Steam libraries
  *   admin - additionally may use the portfolio and price lookup endpoints
  *
  * Keys are compared in constant time so that response timing does not leak how
  * many leading characters of a guessed key were correct.
+ *
+ * Guest access has two sources. Machine clients such as the Google Sheet send a
+ * bearer key; the browser frontend sends a signed session cookie it received in
+ * exchange for an access code. Admin access is bearer only on purpose, so that
+ * a session cookie can never reach an administrative endpoint even if the
+ * cookie handling above it were wrong.
  */
 
 export type AccessLevel = "guest" | "admin";
@@ -63,24 +70,75 @@ function resolve(
   return undefined;
 }
 
-/** Requires any valid key. The admin key satisfies this too. */
+/**
+ * Reads a session cookie. The label is prefixed so that a session and a bearer
+ * key named the same thing cannot share a rate limit bucket or a log line.
+ */
+export function resolveSessionAuth(
+  req: Request,
+): { level: AccessLevel; label: string } | undefined {
+  const raw = parseCookies(req.get("cookie")).get(config.cookieName);
+  const session = verifySession(raw);
+  if (!session) return undefined;
+  return { level: "guest", label: `session:${session.label}` };
+}
+
+/** True when a cookie was sent at all, valid or not. */
+function hasSessionCookie(req: Request): boolean {
+  return parseCookies(req.get("cookie")).has(config.cookieName);
+}
+
+/**
+ * Requires any valid key or a valid session. The admin key satisfies this too.
+ *
+ * A bearer key takes precedence, so a machine client with an unrelated cookie
+ * still authenticates as itself.
+ */
 export function requireGuest(
   req: Request,
   res: Response,
   next: NextFunction,
 ): void {
   const key = extractKey(req);
-  if (!key) {
-    res.status(401).json({ error: "missing_api_key" });
+  if (key) {
+    const auth = resolve(key);
+    if (!auth) {
+      res.status(403).json({ error: "invalid_api_key" });
+      return;
+    }
+    req.auth = auth;
+    next();
     return;
   }
-  const auth = resolve(key);
-  if (!auth) {
-    res.status(403).json({ error: "invalid_api_key" });
+
+  const session = resolveSessionAuth(req);
+  if (session) {
+    req.auth = session;
+    next();
     return;
   }
-  req.auth = auth;
-  next();
+
+  // A cookie that does not verify is reported separately from no cookie at all,
+  // so the frontend can tell "your session ended" from "you were never signed
+  // in". Both mean the same thing to the user: sign in again.
+  if (hasSessionCookie(req)) {
+    res.status(403).json({ error: "invalid_session" });
+    return;
+  }
+  res.status(401).json({ error: "missing_api_key" });
+}
+
+/**
+ * Checks a typed access code against the configured list, in constant time and
+ * against every entry, so neither timing nor early exit reveals which code was
+ * close. Returns the label to put into the session cookie.
+ */
+export function resolveAccessCode(code: string): string | undefined {
+  let label: string | undefined;
+  for (const [candidate, candidateLabel] of config.accessCodes) {
+    if (safeEqual(code, candidate)) label = candidateLabel;
+  }
+  return label;
 }
 
 /** Requires the admin key specifically. */

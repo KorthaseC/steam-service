@@ -7,10 +7,11 @@
     "node": ">=20"
   },
   "scripts": {
-    "build": "tsc",
+    "build": "tsc -p tsconfig.build.json",
     "start": "node dist/server.js",
     "dev": "tsx watch src/server.ts",
     "refresh": "tsx src/cli-refresh.ts",
+    "test": "node --import tsx --test src/steamRef.test.ts src/session.test.ts src/sources/howLongToBeat.test.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

@@ -52,6 +52,47 @@ db.exec(`
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
   );
+
+  CREATE TABLE IF NOT EXISTS steam_profiles (
+    steam_id     TEXT PRIMARY KEY,
+    persona_name TEXT NOT NULL,
+    real_name    TEXT,
+    avatar_url   TEXT NOT NULL,
+    profile_url  TEXT NOT NULL,
+    visibility   INTEGER NOT NULL,
+    fetched_at   INTEGER NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS vanity_resolutions (
+    vanity      TEXT PRIMARY KEY,
+    steam_id    TEXT,
+    resolved_at INTEGER NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS library_cache (
+    steam_id   TEXT PRIMARY KEY,
+    payload    TEXT NOT NULL,
+    fetched_at INTEGER NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS hltb_games (
+    app_id        INTEGER PRIMARY KEY,
+    hltb_id       INTEGER,
+    hltb_name     TEXT,
+    main_story    INTEGER,
+    main_extra    INTEGER,
+    completionist INTEGER,
+    matched       INTEGER NOT NULL,
+    updated_at    INTEGER NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS tracked_games (
+    app_id         INTEGER PRIMARY KEY,
+    name           TEXT NOT NULL,
+    first_seen     INTEGER NOT NULL,
+    last_requested INTEGER NOT NULL,
+    failures       INTEGER NOT NULL DEFAULT 0
+  );
 `);
 
 export interface PriceRecord {
@@ -337,4 +378,327 @@ export function setCachedInventory(
 /** Drops inventory snapshots that nobody has requested in a long time. */
 export function pruneInventoryCache(maxAgeMs: number): void {
   pruneInventoryStmt.run(Date.now() - maxAgeMs);
+}
+
+/* ------------------------------------------------------------------------ *
+ * Steam library and HowLongToBeat
+ *
+ * Same demand driven shape as the price cache above: games seen in a request
+ * land in tracked_games, and the background cycle fills in hltb_games for the
+ * oldest of them. Completion times belong to a game, not to a player, so one
+ * lookup serves every user who owns that title.
+ * ------------------------------------------------------------------------ */
+
+export interface ProfileRecord {
+  steamId: string;
+  personaName: string;
+  realName: string | null;
+  avatarUrl: string;
+  profileUrl: string;
+  visibility: number;
+  fetchedAt: number;
+}
+
+export interface HltbRecord {
+  appId: number;
+  hltbId: number | null;
+  hltbName: string | null;
+  /** All three are minutes, matching Steam's playtime_forever. */
+  mainStory: number | null;
+  mainExtra: number | null;
+  completionist: number | null;
+  matched: boolean;
+  updatedAt: number;
+}
+
+interface ProfileRow {
+  steam_id: string;
+  persona_name: string;
+  real_name: string | null;
+  avatar_url: string;
+  profile_url: string;
+  visibility: number;
+  fetched_at: number;
+}
+
+interface HltbRow {
+  app_id: number;
+  hltb_id: number | null;
+  hltb_name: string | null;
+  main_story: number | null;
+  main_extra: number | null;
+  completionist: number | null;
+  matched: number;
+  updated_at: number;
+}
+
+const selectProfileStmt = db.prepare<[string], ProfileRow>(
+  `SELECT * FROM steam_profiles WHERE steam_id = ?`,
+);
+
+const upsertProfileStmt = db.prepare(`
+  INSERT INTO steam_profiles
+    (steam_id, persona_name, real_name, avatar_url, profile_url, visibility, fetched_at)
+  VALUES (@steamId, @personaName, @realName, @avatarUrl, @profileUrl, @visibility, @fetchedAt)
+  ON CONFLICT (steam_id) DO UPDATE SET
+    persona_name = excluded.persona_name,
+    real_name    = excluded.real_name,
+    avatar_url   = excluded.avatar_url,
+    profile_url  = excluded.profile_url,
+    visibility   = excluded.visibility,
+    fetched_at   = excluded.fetched_at
+`);
+
+const selectVanityStmt = db.prepare<
+  [string],
+  { steam_id: string | null; resolved_at: number }
+>(`SELECT steam_id, resolved_at FROM vanity_resolutions WHERE vanity = ?`);
+
+const upsertVanityStmt = db.prepare(
+  `INSERT INTO vanity_resolutions (vanity, steam_id, resolved_at) VALUES (?, ?, ?)
+   ON CONFLICT (vanity) DO UPDATE SET
+     steam_id = excluded.steam_id, resolved_at = excluded.resolved_at`,
+);
+
+const selectLibraryStmt = db.prepare<[string], InventoryRow>(
+  `SELECT payload, fetched_at FROM library_cache WHERE steam_id = ?`,
+);
+
+const upsertLibraryStmt = db.prepare(
+  `INSERT INTO library_cache (steam_id, payload, fetched_at) VALUES (?, ?, ?)
+   ON CONFLICT (steam_id) DO UPDATE SET
+     payload = excluded.payload, fetched_at = excluded.fetched_at`,
+);
+
+const pruneLibraryStmt = db.prepare(
+  `DELETE FROM library_cache WHERE fetched_at < ?`,
+);
+
+const upsertHltbStmt = db.prepare(`
+  INSERT INTO hltb_games
+    (app_id, hltb_id, hltb_name, main_story, main_extra, completionist, matched, updated_at)
+  VALUES (@appId, @hltbId, @hltbName, @mainStory, @mainExtra, @completionist, @matched, @updatedAt)
+  ON CONFLICT (app_id) DO UPDATE SET
+    hltb_id       = excluded.hltb_id,
+    hltb_name     = excluded.hltb_name,
+    main_story    = excluded.main_story,
+    main_extra    = excluded.main_extra,
+    completionist = excluded.completionist,
+    matched       = excluded.matched,
+    updated_at    = excluded.updated_at
+`);
+
+const trackGameStmt = db.prepare(`
+  INSERT INTO tracked_games (app_id, name, first_seen, last_requested)
+  VALUES (?, ?, ?, ?)
+  ON CONFLICT (app_id) DO UPDATE SET
+    last_requested = excluded.last_requested,
+    name           = excluded.name
+`);
+
+/**
+ * Games whose completion times are missing or stale, oldest first. A matched
+ * and an unmatched row age at different rates: real times barely change, while
+ * a game HowLongToBeat did not know yet is worth another try sooner. Entries
+ * that keep failing sink to the back and drop out past the failure limit.
+ */
+const selectDueGamesStmt = db.prepare<
+  [number, number, number, number],
+  { app_id: number; name: string }
+>(`
+  SELECT t.app_id, t.name
+  FROM tracked_games t
+  LEFT JOIN hltb_games h ON h.app_id = t.app_id
+  WHERE t.failures < ?
+    AND (h.app_id IS NULL
+         OR (h.matched = 1 AND h.updated_at < ?)
+         OR (h.matched = 0 AND h.updated_at < ?))
+  ORDER BY t.failures ASC, COALESCE(h.updated_at, 0) ASC
+  LIMIT ?
+`);
+
+const countDueGamesStmt = db.prepare<
+  [number, number, number],
+  { total: number }
+>(`
+  SELECT COUNT(*) AS total
+  FROM tracked_games t
+  LEFT JOIN hltb_games h ON h.app_id = t.app_id
+  WHERE t.failures < ?
+    AND (h.app_id IS NULL
+         OR (h.matched = 1 AND h.updated_at < ?)
+         OR (h.matched = 0 AND h.updated_at < ?))
+`);
+
+const markGameFailureStmt = db.prepare(
+  `UPDATE tracked_games SET failures = failures + 1 WHERE app_id = ?`,
+);
+
+const markGameSuccessStmt = db.prepare(
+  `UPDATE tracked_games SET failures = 0 WHERE app_id = ?`,
+);
+
+const pruneTrackedGamesStmt = db.prepare(
+  `DELETE FROM tracked_games WHERE last_requested < ?`,
+);
+
+const countHltbStmt = db.prepare<[number], { total: number }>(
+  `SELECT COUNT(*) AS total FROM hltb_games WHERE matched = ?`,
+);
+
+/** Chunked lookup for hltb_games, same reasoning as selectPricesStmt above. */
+const selectHltbStmts = new Map<number, Database.Statement<number[], HltbRow>>();
+
+function selectHltbStmt(size: number): Database.Statement<number[], HltbRow> {
+  let statement = selectHltbStmts.get(size);
+  if (!statement) {
+    const placeholders = new Array<string>(size).fill("?").join(",");
+    statement = db.prepare<number[], HltbRow>(
+      `SELECT * FROM hltb_games WHERE app_id IN (${placeholders})`,
+    );
+    selectHltbStmts.set(size, statement);
+  }
+  return statement;
+}
+
+function toHltbRecord(row: HltbRow): HltbRecord {
+  return {
+    appId: row.app_id,
+    hltbId: row.hltb_id,
+    hltbName: row.hltb_name,
+    mainStory: row.main_story,
+    mainExtra: row.main_extra,
+    completionist: row.completionist,
+    matched: row.matched === 1,
+    updatedAt: row.updated_at,
+  };
+}
+
+export function getCachedProfile(steamId: string): ProfileRecord | undefined {
+  const row = selectProfileStmt.get(steamId);
+  if (!row) return undefined;
+  return {
+    steamId: row.steam_id,
+    personaName: row.persona_name,
+    realName: row.real_name,
+    avatarUrl: row.avatar_url,
+    profileUrl: row.profile_url,
+    visibility: row.visibility,
+    fetchedAt: row.fetched_at,
+  };
+}
+
+export function setCachedProfile(profile: ProfileRecord): void {
+  upsertProfileStmt.run(profile);
+}
+
+/**
+ * A resolution with a null steamId is a remembered "no such vanity name", so a
+ * typo does not hit Steam again on every reload.
+ */
+export function getVanityResolution(
+  vanity: string,
+): { steamId: string | null; resolvedAt: number } | undefined {
+  const row = selectVanityStmt.get(vanity);
+  return row ? { steamId: row.steam_id, resolvedAt: row.resolved_at } : undefined;
+}
+
+export function setVanityResolution(
+  vanity: string,
+  steamId: string | null,
+  resolvedAt: number,
+): void {
+  upsertVanityStmt.run(vanity, steamId, resolvedAt);
+}
+
+export function getCachedLibrary(
+  steamId: string,
+): { payload: string; fetchedAt: number } | undefined {
+  const row = selectLibraryStmt.get(steamId);
+  return row ? { payload: row.payload, fetchedAt: row.fetched_at } : undefined;
+}
+
+export function setCachedLibrary(
+  steamId: string,
+  payload: string,
+  fetchedAt: number,
+): void {
+  upsertLibraryStmt.run(steamId, payload, fetchedAt);
+}
+
+export function pruneLibraryCache(maxAgeMs: number): void {
+  pruneLibraryStmt.run(Date.now() - maxAgeMs);
+}
+
+/** Bulk lookup of completion times, chunked for SQLite's parameter limit. */
+export function getHltbFor(appIds: number[]): Map<number, HltbRecord> {
+  const result = new Map<number, HltbRecord>();
+  const chunkSize = 400;
+  for (let i = 0; i < appIds.length; i += chunkSize) {
+    const chunk = appIds.slice(i, i + chunkSize);
+    for (const row of selectHltbStmt(chunk.length).all(...chunk)) {
+      result.set(row.app_id, toHltbRecord(row));
+    }
+  }
+  return result;
+}
+
+/** Writes one game's result, matched or not. */
+export function upsertHltb(record: Omit<HltbRecord, "updatedAt">, updatedAt: number): void {
+  upsertHltbStmt.run({
+    appId: record.appId,
+    hltbId: record.hltbId,
+    hltbName: record.hltbName,
+    mainStory: record.mainStory,
+    mainExtra: record.mainExtra,
+    completionist: record.completionist,
+    matched: record.matched ? 1 : 0,
+    updatedAt,
+  });
+}
+
+/** Records games as worth looking up, refreshing their last requested stamp. */
+export const trackGames = db.transaction(
+  (games: Array<{ appId: number; name: string }>, now: number) => {
+    for (const game of games) {
+      trackGameStmt.run(game.appId, game.name, now, now);
+    }
+  },
+);
+
+export function selectDueGames(
+  maxFailures: number,
+  matchedBefore: number,
+  unmatchedBefore: number,
+  limit: number,
+): Array<{ appId: number; name: string }> {
+  return selectDueGamesStmt
+    .all(maxFailures, matchedBefore, unmatchedBefore, limit)
+    .map((row) => ({ appId: row.app_id, name: row.name }));
+}
+
+export function countDueGames(
+  maxFailures: number,
+  matchedBefore: number,
+  unmatchedBefore: number,
+): number {
+  return (
+    countDueGamesStmt.get(maxFailures, matchedBefore, unmatchedBefore)?.total ?? 0
+  );
+}
+
+export function markGameLookupFailure(appId: number): void {
+  markGameFailureStmt.run(appId);
+}
+
+export function markGameLookupSuccess(appId: number): void {
+  markGameSuccessStmt.run(appId);
+}
+
+export function pruneTrackedGames(maxIdleMs: number): void {
+  pruneTrackedGamesStmt.run(Date.now() - maxIdleMs);
+}
+
+export function countHltbGames(matched: boolean): number {
+  return countHltbStmt.get(matched ? 1 : 0)?.total ?? 0;
 }

@@ -1,7 +1,8 @@
 import express from "express";
 import helmet from "helmet";
 import { config } from "./config.js";
-import { db, pruneInventoryCache } from "./db.js";
+import { db, pruneInventoryCache, pruneLibraryCache } from "./db.js";
+import { startHltbWorker } from "./hltb.js";
 import { startPriceWorker } from "./prices.js";
 import { router } from "./routes.js";
 
@@ -59,17 +60,20 @@ const server = app.listen(config.port, config.host, () => {
 });
 
 const priceTimer = startPriceWorker();
+const hltbTimer = startHltbWorker();
 
-// Inventory snapshots older than a day are of no use to anybody.
-const pruneTimer = setInterval(
-  () => pruneInventoryCache(24 * 60 * 60 * 1000),
-  60 * 60 * 1000,
-);
+// Cached snapshots older than a day are of no use to anybody. Libraries are
+// kept a week: they change slowly and refetching one costs a Web API call.
+const pruneTimer = setInterval(() => {
+  pruneInventoryCache(24 * 60 * 60 * 1000);
+  pruneLibraryCache(7 * 24 * 60 * 60 * 1000);
+}, 60 * 60 * 1000);
 pruneTimer.unref();
 
 function shutdown(signal: string): void {
   console.log(`[server] ${signal} received, shutting down`);
   clearInterval(priceTimer);
+  clearInterval(hltbTimer);
   clearInterval(pruneTimer);
   server.close(() => {
     // Closing checkpoints the write ahead log, so no .wal file is left behind.
