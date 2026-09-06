@@ -1,0 +1,34 @@
+[Unit]
+Description=CS2 inventory price service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=csprices
+Group=csprices
+WorkingDirectory=/opt/cs-price-service
+EnvironmentFile=/opt/cs-price-service/.env
+ExecStart=/usr/bin/node dist/server.js
+Restart=on-failure
+RestartSec=10
+
+# Hardening: the service needs outbound HTTPS and its own data directory,
+# nothing else on the system.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/cs-price-service/data
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=false
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

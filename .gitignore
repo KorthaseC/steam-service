@@ -1,0 +1,8 @@
+node_modules/
+dist/
+data/
+.env
+
+# Local deployment config, not part of the repository
+deploy/Caddyfile
+deploy/Caddyfile.snippet
