@@ -1,4 +1,4 @@
-# CS Price Service
+# Steam Service
 
 A self-hosted HTTP API around public Steam data. Two feature sets share one
 process, one database and one deployment:
@@ -49,7 +49,7 @@ hours to work out, so it is worth writing down:
 | Client identity                                                              | Result |
 | ---------------------------------------------------------------------------- | ------ |
 | No user agent                                                                | 429    |
-| Custom user agent (`cs-price-service/1.0`)                                   | 429    |
+| Custom user agent naming this service                                        | 429    |
 | Known tool signature (`curl/8.5.0`, `Wget/1.21.4`, `python-requests/2.31.0`) | 200    |
 | Browser user agent, nothing else                                             | 429    |
 | Browser user agent plus the matching browser headers                         | 200    |
@@ -155,8 +155,8 @@ GET /api/steam/library/:ref
 ## Installation
 
 ```bash
-git clone <this-repo> cs-price-service
-cd cs-price-service
+git clone <this-repo> steam-service
+cd steam-service
 
 npm install
 npm run build
@@ -182,25 +182,30 @@ For development: `npm run dev` (tsx watch mode).
 
 ### Running as a service
 
-`deploy/cs-price-service.service` is a systemd unit to start from.
+`deploy/steam-service.service` is a systemd unit to start from.
 
 ```bash
-sudo useradd --system --home /opt/cs-price-service --shell /usr/sbin/nologin csprices
-sudo mkdir -p /opt/cs-price-service
+sudo useradd --system --home /opt/steam-service --shell /usr/sbin/nologin csprices
+sudo mkdir -p /opt/steam-service
 # copy the project there, then:
-sudo chown -R csprices:csprices /opt/cs-price-service
+sudo chown -R csprices:csprices /opt/steam-service
 
-sudo cp deploy/cs-price-service.service /etc/systemd/system/
+sudo cp deploy/steam-service.service /etc/systemd/system/
 sudo systemctl daemon-reload
-sudo systemctl enable --now cs-price-service
-sudo journalctl -u cs-price-service -f
+sudo systemctl enable --now steam-service
+sudo journalctl -u steam-service -f
 ```
 
-The unit expects the app at `/opt/cs-price-service` running as user `csprices`,
+The unit expects the app at `/opt/steam-service` running as user `csprices`,
 with `data/` as the only writable path — adjust both if you deploy elsewhere.
 
+The three paths in the unit and the directory you actually deploy to have to
+match; nothing else depends on the name. An installation that predates the
+rename to `steam-service` keeps working under its old path and unit name — there
+is no need to migrate it, and `git pull` into the old directory is unaffected.
+
 Update routine, in this order: `git pull`, `npm run build`,
-`chown -R csprices:csprices .`, `systemctl restart cs-price-service`. The chown
+`chown -R csprices:csprices .`, `systemctl restart steam-service`. The chown
 matters — a build run as root leaves `dist/` unreadable for the service user.
 
 ### Reverse proxy requirements

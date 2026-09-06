@@ -1,7 +1,7 @@
 {
-  "name": "cs-price-service",
+  "name": "steam-service",
   "version": "1.0.0",
-  "description": "Self-hosted CS2 inventory valuation API with a cached Steam market price store",
+  "description": "Self-hosted API around public Steam data: CS2 inventory valuation with a cached market price store, plus Steam libraries matched against HowLongToBeat",
   "type": "module",
   "engines": {
     "node": ">=20"

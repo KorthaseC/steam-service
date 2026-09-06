@@ -1,5 +1,5 @@
 [Unit]
-Description=CS2 inventory price service
+Description=Steam service: CS2 inventory pricing and library completion times
 After=network-online.target
 Wants=network-online.target
 
@@ -7,8 +7,8 @@ Wants=network-online.target
 Type=simple
 User=csprices
 Group=csprices
-WorkingDirectory=/opt/cs-price-service
-EnvironmentFile=/opt/cs-price-service/.env
+WorkingDirectory=/opt/steam-service
+EnvironmentFile=/opt/steam-service/.env
 ExecStart=/usr/bin/node dist/server.js
 Restart=on-failure
 RestartSec=10
@@ -19,7 +19,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/opt/cs-price-service/data
+ReadWritePaths=/opt/steam-service/data
 PrivateDevices=true
 ProtectKernelTunables=true
 ProtectKernelModules=true
