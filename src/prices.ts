@@ -1,23 +1,30 @@
 import { config } from "./config.js";
 import {
+  countDueItems,
   countPrices,
+  countTrackedItems,
   getMeta,
   getPricesFor,
+  markLookupFailure,
+  markLookupSuccess,
+  pruneTrackedItems,
   recordHistory,
+  selectDueItems,
   setMeta,
+  trackItems,
   upsertPrices,
   type PriceRecord,
 } from "./db.js";
-import { fetchBulkPrices } from "./sources/bulkDump.js";
 import {
   isSteamLookupBlocked,
   lookupSteamPrice,
 } from "./sources/steamMarket.js";
 
 /**
- * Owns the price cache: refreshes it on a schedule and answers lookups from
- * the database, only touching Steam directly for names the dump does not
- * cover.
+ * Owns the price cache. Pricing is demand driven: names arriving in requests
+ * are tracked, and a background cycle refreshes the oldest tracked prices a
+ * batch at a time. Steam's rate limit makes crawling the full catalogue
+ * impossible, so only what is actually asked about is kept current.
  */
 
 const LAST_REFRESH_KEY = "last_price_refresh";
@@ -26,49 +33,84 @@ const LAST_REFRESH_COUNT_KEY = "last_price_refresh_count";
 let refreshInFlight: Promise<RefreshResult> | null = null;
 
 export interface RefreshResult {
-  itemCount: number;
-  historyRows: number;
-  rate: number;
-  rateSource: string;
+  /** Names that were due and attempted in this cycle. */
+  attempted: number;
+  /** Prices successfully written. */
+  updated: number;
+  /** Lookups Steam did not answer with a price. */
+  failed: number;
+  /** Names still due after this cycle. */
+  remaining: number;
+  /** True when the cycle stopped early because Steam is rate limiting. */
+  steamBlocked: boolean;
   durationMs: number;
 }
 
+function dueBefore(): number {
+  return Date.now() - config.priceMaxAgeHours * 60 * 60 * 1000;
+}
+
 /**
- * Pulls the bulk dump into the local store. Concurrent calls share one run so
- * that a manual refresh cannot pile up on top of the scheduled one.
+ * Refreshes up to `budget` due prices. Concurrent calls share one run so a
+ * manual refresh cannot pile up on top of the scheduled one.
  */
-export function refreshPrices(): Promise<RefreshResult> {
+export function refreshPrices(
+  budget = config.refreshBatchSize,
+): Promise<RefreshResult> {
   if (refreshInFlight) return refreshInFlight;
 
   refreshInFlight = (async () => {
     const started = Date.now();
-    const { prices, rate, rateSource } = await fetchBulkPrices();
+    const due = selectDueItems(dueBefore(), config.maxLookupFailures, budget);
 
-    upsertPrices(prices, started);
+    let updated = 0;
+    let failed = 0;
 
-    let historyRows = 0;
-    if (config.enableHistory) {
-      historyRows = recordHistory(
-        prices,
-        started,
-        config.historyIntervalHours * 60 * 60 * 1000,
-      );
+    for (const name of due) {
+      // Stop rather than queue behind a five minute backoff.
+      if (isSteamLookupBlocked()) break;
+
+      const price = await lookupSteamPrice(name);
+      if (price === undefined) {
+        markLookupFailure(name);
+        failed++;
+        continue;
+      }
+
+      const now = Date.now();
+      // Written per item so that an interrupted cycle keeps its progress.
+      upsertPrices([{ name, price, source: "steam" }], now);
+      if (config.enableHistory) {
+        recordHistory(
+          [{ name, price }],
+          now,
+          config.historyIntervalHours * 60 * 60 * 1000,
+        );
+      }
+      markLookupSuccess(name);
+      updated++;
     }
 
     setMeta(LAST_REFRESH_KEY, String(started));
-    setMeta(LAST_REFRESH_COUNT_KEY, String(prices.length));
+    setMeta(LAST_REFRESH_COUNT_KEY, String(updated));
+    pruneTrackedItems(config.trackedRetentionDays * 24 * 60 * 60 * 1000);
 
     const result: RefreshResult = {
-      itemCount: prices.length,
-      historyRows,
-      rate,
-      rateSource,
+      attempted: due.length,
+      updated,
+      failed,
+      remaining: countDueItems(dueBefore(), config.maxLookupFailures),
+      steamBlocked: isSteamLookupBlocked(),
       durationMs: Date.now() - started,
     };
-    console.log(
-      `[prices] refreshed ${result.itemCount} items in ${result.durationMs}ms ` +
-        `(history rows: ${historyRows}, rate: ${rate} via ${rateSource})`,
-    );
+
+    if (result.attempted > 0) {
+      console.log(
+        `[prices] refreshed ${result.updated}/${result.attempted} items in ` +
+          `${Math.round(result.durationMs / 1000)}s ` +
+          `(failed: ${result.failed}, still due: ${result.remaining})`,
+      );
+    }
     return result;
   })().finally(() => {
     refreshInFlight = null;
@@ -80,21 +122,24 @@ export function refreshPrices(): Promise<RefreshResult> {
 export interface PriceLookupResult {
   /** Prices found, keyed by market hash name. */
   prices: Map<string, PriceRecord>;
-  /** Names that could not be priced from any source. */
+  /** Names that could not be priced at all. */
   missing: string[];
-  /** True when the direct Steam fallback is currently rate limited. */
+  /** True when direct lookups are currently rate limited. */
   steamBlocked: boolean;
 }
 
 /**
- * Resolves prices for a list of names. Anything missing from the cache is
- * looked up directly at Steam, up to the configured per request budget, and
- * the result is written back so the next caller gets it for free.
+ * Resolves prices for a list of names and records them as worth tracking, so
+ * the background cycle keeps them current from now on. Names with no price yet
+ * are looked up immediately, up to the per request budget; the rest are picked
+ * up by the next cycle.
  */
 export async function resolvePrices(
   names: string[],
 ): Promise<PriceLookupResult> {
   const unique = [...new Set(names.filter((name) => name.length > 0))];
+  if (unique.length > 0) trackItems(unique, Date.now());
+
   const prices = getPricesFor(unique);
   const missing = unique.filter((name) => !prices.has(name));
 
@@ -111,9 +156,12 @@ export async function resolvePrices(
 
   for (const name of budget) {
     const price = await lookupSteamPrice(name);
-    if (price !== undefined) {
-      resolved.push({ name, price, source: "steam" });
+    if (price === undefined) {
+      markLookupFailure(name);
+      continue;
     }
+    markLookupSuccess(name);
+    resolved.push({ name, price, source: "steam" });
   }
 
   if (resolved.length > 0) {
@@ -144,6 +192,8 @@ export function netAfterFee(price: number): number {
 
 export function priceStoreStatus(): {
   itemCount: number;
+  trackedItems: number;
+  dueItems: number;
   lastRefresh: number | null;
   lastRefreshItems: number | null;
   stale: boolean;
@@ -151,20 +201,22 @@ export function priceStoreStatus(): {
   const lastRefreshRaw = getMeta(LAST_REFRESH_KEY);
   const lastRefresh = lastRefreshRaw ? Number(lastRefreshRaw) : null;
   const lastCountRaw = getMeta(LAST_REFRESH_COUNT_KEY);
+
+  // Stale means the cycle itself stopped running, not that individual prices
+  // are old: three missed cycles is well past any normal delay.
+  const staleAfterMs = config.priceRefreshMinutes * 60_000 * 3;
+
   return {
     itemCount: countPrices(),
+    trackedItems: countTrackedItems(),
+    dueItems: countDueItems(dueBefore(), config.maxLookupFailures),
     lastRefresh,
     lastRefreshItems: lastCountRaw ? Number(lastCountRaw) : null,
-    stale:
-      lastRefresh === null ||
-      Date.now() - lastRefresh > config.priceStaleMinutes * 60_000,
+    stale: lastRefresh === null || Date.now() - lastRefresh > staleAfterMs,
   };
 }
 
-/**
- * Starts the background refresh loop. An empty store is filled immediately,
- * otherwise the first run waits for the normal interval.
- */
+/** Starts the background refresh cycle. A run with nothing due is a no-op. */
 export function startPriceWorker(): NodeJS.Timeout {
   const run = () => {
     refreshPrices().catch((error) => {
@@ -172,10 +224,7 @@ export function startPriceWorker(): NodeJS.Timeout {
     });
   };
 
-  const status = priceStoreStatus();
-  if (status.itemCount === 0 || status.stale) {
-    run();
-  }
+  run();
 
   const timer = setInterval(run, config.priceRefreshMinutes * 60_000);
   // Do not hold the event loop open purely for the refresh timer.

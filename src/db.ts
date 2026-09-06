@@ -3,7 +3,10 @@ import { config } from "./config.js";
 
 /**
  * SQLite is used as a local cache so that no user request ever has to wait for
- * Steam. Everything in here is derived data and can be rebuilt by a refresh.
+ * Steam. Everything in here is derived data and can be rebuilt over time.
+ *
+ * Pricing is demand driven: names seen in requests are recorded in
+ * tracked_items, and the background worker refreshes the oldest of those.
  */
 
 export const db = new Database(config.dbPath);
@@ -31,6 +34,13 @@ db.exec(`
 
   CREATE INDEX IF NOT EXISTS idx_price_history_name
     ON price_history (market_hash_name, recorded_at DESC);
+
+  CREATE TABLE IF NOT EXISTS tracked_items (
+    market_hash_name TEXT PRIMARY KEY,
+    first_seen       INTEGER NOT NULL,
+    last_requested   INTEGER NOT NULL,
+    failures         INTEGER NOT NULL DEFAULT 0
+  );
 
   CREATE TABLE IF NOT EXISTS inventory_cache (
     steam_id   TEXT PRIMARY KEY,
@@ -60,6 +70,11 @@ interface PriceRow {
   updated_at: number;
 }
 
+interface InventoryRow {
+  payload: string;
+  fetched_at: number;
+}
+
 const upsertPriceStmt = db.prepare(`
   INSERT INTO prices (market_hash_name, price, currency, source, updated_at)
   VALUES (@name, @price, @currency, @source, @updatedAt)
@@ -85,8 +100,53 @@ const insertHistoryStmt = db.prepare(`
   VALUES (@name, @price, @currency, @recordedAt)
 `);
 
+const trackItemStmt = db.prepare(`
+  INSERT INTO tracked_items (market_hash_name, first_seen, last_requested)
+  VALUES (?, ?, ?)
+  ON CONFLICT (market_hash_name) DO UPDATE SET last_requested = excluded.last_requested
+`);
+
+/**
+ * Names whose price is missing or past its maximum age, oldest first. Entries
+ * that keep failing sink to the back and drop out entirely once they exceed
+ * the failure limit, so a permanently unlistable item cannot block the queue.
+ */
+const selectDueStmt = db.prepare<[number, number, number], { name: string }>(`
+  SELECT t.market_hash_name AS name
+  FROM tracked_items t
+  LEFT JOIN prices p ON p.market_hash_name = t.market_hash_name
+  WHERE t.failures < ?
+    AND (p.updated_at IS NULL OR p.updated_at < ?)
+  ORDER BY t.failures ASC, COALESCE(p.updated_at, 0) ASC
+  LIMIT ?
+`);
+
+const countDueStmt = db.prepare<[number, number], { total: number }>(`
+  SELECT COUNT(*) AS total
+  FROM tracked_items t
+  LEFT JOIN prices p ON p.market_hash_name = t.market_hash_name
+  WHERE t.failures < ?
+    AND (p.updated_at IS NULL OR p.updated_at < ?)
+`);
+
+const markFailureStmt = db.prepare(
+  `UPDATE tracked_items SET failures = failures + 1 WHERE market_hash_name = ?`,
+);
+
+const markSuccessStmt = db.prepare(
+  `UPDATE tracked_items SET failures = 0 WHERE market_hash_name = ?`,
+);
+
+const pruneTrackedStmt = db.prepare(
+  `DELETE FROM tracked_items WHERE last_requested < ?`,
+);
+
 const countPricesStmt = db.prepare<[], { total: number }>(
   `SELECT COUNT(*) AS total FROM prices`,
+);
+
+const countTrackedStmt = db.prepare<[], { total: number }>(
+  `SELECT COUNT(*) AS total FROM tracked_items`,
 );
 
 const selectMetaStmt = db.prepare<[string], { value: string }>(
@@ -98,10 +158,9 @@ const upsertMetaStmt = db.prepare(
    ON CONFLICT (key) DO UPDATE SET value = excluded.value`,
 );
 
-const selectInventoryStmt = db.prepare<
-  [string],
-  { payload: string; fetched_at: number }
->(`SELECT payload, fetched_at FROM inventory_cache WHERE steam_id = ?`);
+const selectInventoryStmt = db.prepare<[string], InventoryRow>(
+  `SELECT payload, fetched_at FROM inventory_cache WHERE steam_id = ?`,
+);
 
 const upsertInventoryStmt = db.prepare(
   `INSERT INTO inventory_cache (steam_id, payload, fetched_at) VALUES (?, ?, ?)
@@ -165,8 +224,7 @@ export const upsertPrices = db.transaction(
 
 /**
  * Appends history rows, but only for items whose last snapshot is older than
- * the configured interval. Without that guard a 30 minute refresh cycle would
- * write millions of rows per week.
+ * the configured interval, so a frequent refresh does not bloat the table.
  */
 export const recordHistory = db.transaction(
   (
@@ -189,6 +247,39 @@ export const recordHistory = db.transaction(
     return written;
   },
 );
+
+/** Records names as worth pricing, refreshing their last requested timestamp. */
+export const trackItems = db.transaction((names: string[], now: number) => {
+  for (const name of names) {
+    trackItemStmt.run(name, now, now);
+  }
+});
+
+export function selectDueItems(
+  olderThan: number,
+  maxFailures: number,
+  limit: number,
+): string[] {
+  return selectDueStmt
+    .all(maxFailures, olderThan, limit)
+    .map((row) => row.name);
+}
+
+export function countDueItems(olderThan: number, maxFailures: number): number {
+  return countDueStmt.get(maxFailures, olderThan)?.total ?? 0;
+}
+
+export function markLookupFailure(name: string): void {
+  markFailureStmt.run(name);
+}
+
+export function markLookupSuccess(name: string): void {
+  markSuccessStmt.run(name);
+}
+
+export function pruneTrackedItems(maxIdleMs: number): void {
+  pruneTrackedStmt.run(Date.now() - maxIdleMs);
+}
 
 export function getPrice(marketHashName: string): PriceRecord | undefined {
   const row = selectPriceStmt.get(marketHashName);
@@ -214,6 +305,10 @@ export function getPricesFor(names: string[]): Map<string, PriceRecord> {
 
 export function countPrices(): number {
   return countPricesStmt.get()?.total ?? 0;
+}
+
+export function countTrackedItems(): number {
+  return countTrackedStmt.get()?.total ?? 0;
 }
 
 export function getMeta(key: string): string | undefined {

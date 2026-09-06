@@ -37,8 +37,8 @@ function bool(name: string, fallback: boolean): boolean {
 
 /**
  * Parses "key:label,key:label" into a lookup from key to a human readable
- * label. The label is only used for logging so that a noisy key can be
- * identified and revoked.
+ * label. The label identifies a key in the log and is its rate limit bucket,
+ * so it has to be unique per entry.
  */
 function parseGuestKeys(raw: string): Map<string, string> {
   const keys = new Map<string, string>();
@@ -85,12 +85,21 @@ export const config = {
   dbPath: path.join(dataDir, "prices.sqlite"),
 
   currency: currency as "EUR" | "USD",
-  priceRefreshMinutes: num("PRICE_REFRESH_MINUTES", 30),
-  priceStaleMinutes: num("PRICE_STALE_MINUTES", 180),
+
+  /** How often the background refresh cycle runs. */
+  priceRefreshMinutes: num("PRICE_REFRESH_MINUTES", 60),
+  /** A price older than this is queued for refresh and reported as stale. */
+  priceMaxAgeHours: num("PRICE_MAX_AGE_HOURS", 12),
+  /** Upper bound on lookups per refresh cycle, so one cycle stays bounded. */
+  refreshBatchSize: num("PRICE_REFRESH_BATCH", 150),
+  /** A name that fails this often in a row is dropped from the refresh queue. */
+  maxLookupFailures: num("MAX_LOOKUP_FAILURES", 5),
+  /** Names nobody has asked about for this long are forgotten. */
+  trackedRetentionDays: num("TRACKED_RETENTION_DAYS", 30),
+
   historyIntervalHours: num("HISTORY_INTERVAL_HOURS", 24),
   enableHistory: bool("ENABLE_HISTORY", true),
   steamFeeDivisor: num("STEAM_FEE_DIVISOR", 1.15),
-  usdToEurFallback: num("USD_TO_EUR_FALLBACK", 0.92),
 
   steamFallbackEnabled: bool("STEAM_FALLBACK_ENABLED", true),
   steamFallbackDelayMs: num("STEAM_FALLBACK_DELAY_MS", 4000),
