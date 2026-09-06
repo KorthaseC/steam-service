@@ -1,122 +1,199 @@
 import { config } from "./../config.js";
 import { getUsdToTargetRate } from "./../fx.js";
+import { parsePriceString } from "./steamMarket.js";
 
 /**
- * Bulk source for Steam market prices. One request returns the whole CS2
- * catalogue, which avoids the per item rate limit that makes the official
- * priceoverview endpoint unusable for entire inventories.
+ * Bulk source for Steam market prices, built on Steam's own market search.
+ * That endpoint returns 100 items per call instead of the single item that
+ * priceoverview yields, so the whole CS2 catalogue is reachable in a few
+ * hundred throttled requests rather than tens of thousands.
  *
- * The payload maps a market hash name to price entries per marketplace. Only
- * the Steam block is used here, preferring the most recent averaging window
- * that actually contains a value. The dump is regenerated once a day, so
- * refreshing more often than a few hours gains nothing.
+ * A full crawl takes roughly fifteen minutes and runs in the background, so
+ * requests are always answered from the database and never wait for it.
  */
 
-const DUMP_URL = "https://prices.csgotrader.app/latests.json";
+const SEARCH_URL = "https://steamcommunity.com/market/search/render/";
+const CURRENCY_CODES: Record<string, number> = { USD: 1, EUR: 3 };
+const APP_ID = 730;
+const PAGE_SIZE = 100;
 
-interface SteamPriceWindows {
-  last_24h?: number | null;
-  last_7d?: number | null;
-  last_30d?: number | null;
-  last_90d?: number | null;
-  price?: number | null;
+/** Hard stop so a broken total_count cannot turn into an endless crawl. */
+const MAX_PAGES = 400;
+/** Steam blocks the IP for minutes after a burst, so a 429 pauses the crawl. */
+const RATE_LIMIT_BACKOFF_MS = 5 * 60_000;
+const MAX_ATTEMPTS_PER_PAGE = 3;
+
+interface SearchResultItem {
+  hash_name?: string;
+  sell_listings?: number;
+  /** Lowest listing in minor units of the requested currency. */
+  sell_price?: number;
+  sell_price_text?: string;
+  asset_description?: { market_hash_name?: string };
 }
 
-/** The Steam block is usually an object of averaging windows, sometimes a bare number. */
-type SteamPriceBlock = SteamPriceWindows | number | null;
-
-interface DumpEntry {
-  steam?: SteamPriceBlock;
+interface SearchResponse {
+  success?: boolean;
+  start?: number;
+  total_count?: number;
+  results?: SearchResultItem[] | null;
 }
 
 export interface DumpResult {
   prices: Array<{ name: string; price: number; source: string }>;
   rate: number;
   rateSource: string;
+  url: string;
 }
 
-function usable(value: unknown): value is number {
-  return typeof value === "number" && Number.isFinite(value) && value > 0;
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-/** Picks the freshest averaging window that holds a positive number. */
-function pickSteamPrice(
-  block: SteamPriceBlock | undefined,
-): number | undefined {
-  if (block === null || block === undefined) return undefined;
-  if (typeof block === "number") return usable(block) ? block : undefined;
+/**
+ * Steam usually honours the currency parameter, but falls back to USD for
+ * anonymous callers in some regions. The price text carries the symbol, so it
+ * decides whether a conversion is needed rather than the request parameter.
+ */
+function currencyOf(text: string | undefined): "EUR" | "USD" | undefined {
+  if (!text) return undefined;
+  if (text.includes("€")) return "EUR";
+  if (text.includes("$")) return "USD";
+  return undefined;
+}
 
-  const candidates = [
-    block.last_24h,
-    block.last_7d,
-    block.last_30d,
-    block.last_90d,
-    block.price,
-  ];
-  for (const value of candidates) {
-    if (usable(value)) return value;
+function pageUrl(start: number): string {
+  const params = new URLSearchParams({
+    appid: String(APP_ID),
+    norender: "1",
+    count: String(PAGE_SIZE),
+    start: String(start),
+    currency: String(CURRENCY_CODES[config.currency] ?? 3),
+    search_descriptions: "0",
+  });
+  return `${SEARCH_URL}?${params}`;
+}
+
+/**
+ * Fetches one page, retrying after a backoff when Steam rate limits. Returns
+ * undefined once the attempts are used up, which ends the crawl and keeps
+ * whatever was collected so far.
+ */
+async function fetchPage(start: number): Promise<SearchResponse | undefined> {
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS_PER_PAGE; attempt++) {
+    try {
+      const response = await fetch(pageUrl(start), {
+        signal: AbortSignal.timeout(config.outboundTimeoutMs),
+        headers: {
+          "User-Agent": config.userAgent,
+          Accept: "application/json",
+          Referer: "https://steamcommunity.com/market/",
+        },
+      });
+
+      if (response.status === 429 || response.status === 403) {
+        console.warn(
+          `[prices] Steam rate limited at offset ${start}, waiting 5 minutes ` +
+            `(attempt ${attempt}/${MAX_ATTEMPTS_PER_PAGE})`,
+        );
+        await sleep(RATE_LIMIT_BACKOFF_MS);
+        continue;
+      }
+      if (!response.ok) {
+        console.warn(
+          `[prices] offset ${start} returned status ${response.status}`,
+        );
+        await sleep(config.steamFallbackDelayMs);
+        continue;
+      }
+
+      // Steam answers with an HTML error page instead of a status code when
+      // it is unhappy, so the body is inspected before parsing.
+      const body = await response.text();
+      if (!body.trimStart().startsWith("{")) {
+        console.warn(`[prices] offset ${start} returned a non-JSON body`);
+        await sleep(RATE_LIMIT_BACKOFF_MS);
+        continue;
+      }
+
+      return JSON.parse(body) as SearchResponse;
+    } catch (error) {
+      console.warn(
+        `[prices] offset ${start} failed: ${(error as Error).message} ` +
+          `(attempt ${attempt}/${MAX_ATTEMPTS_PER_PAGE})`,
+      );
+      await sleep(config.steamFallbackDelayMs);
+    }
   }
   return undefined;
+}
+
+/** Extracts a price in the target currency, converting only when Steam sent USD. */
+function priceOf(item: SearchResultItem, usdRate: number): number | undefined {
+  const raw =
+    typeof item.sell_price === "number" && item.sell_price > 0
+      ? item.sell_price / 100
+      : parsePriceString(item.sell_price_text ?? "");
+
+  if (raw === undefined || !Number.isFinite(raw) || raw <= 0) return undefined;
+
+  const sent = currencyOf(item.sell_price_text);
+  const converted =
+    sent === "USD" && config.currency === "EUR" ? raw * usdRate : raw;
+  return Math.round(converted * 100) / 100;
 }
 
 export async function fetchBulkPrices(): Promise<DumpResult> {
   const { rate, source: rateSource } = await getUsdToTargetRate();
 
-  const response = await fetch(DUMP_URL, {
-    signal: AbortSignal.timeout(120_000),
-    headers: {
-      "User-Agent": config.userAgent,
-      Accept: "application/json",
-    },
-  });
+  const collected = new Map<string, number>();
+  let totalCount = Number.POSITIVE_INFINITY;
+  let start = 0;
+  let pages = 0;
 
-  if (!response.ok) {
-    throw new Error(`Bulk price dump returned status ${response.status}`);
+  while (start < totalCount && pages < MAX_PAGES) {
+    const page = await fetchPage(start);
+    if (!page) break;
+
+    if (typeof page.total_count === "number" && page.total_count > 0) {
+      totalCount = page.total_count;
+    }
+
+    const results = page.results ?? [];
+    if (results.length === 0) break;
+
+    for (const item of results) {
+      const name = item.asset_description?.market_hash_name ?? item.hash_name;
+      if (!name) continue;
+      const price = priceOf(item, rate);
+      if (price === undefined) continue;
+      collected.set(name, price);
+    }
+
+    pages++;
+    start += results.length;
+
+    // Progress matters here: a full crawl runs for a quarter of an hour.
+    if (pages % 25 === 0) {
+      console.log(
+        `[prices] crawled ${collected.size} items (offset ${start}/${totalCount})`,
+      );
+    }
+
+    await sleep(config.steamFallbackDelayMs);
   }
 
-  // A moved or deleted dump answers with an HTML notice and status 200, so the
-  // body is checked before parsing to produce a readable error instead of a
-  // JSON syntax complaint about a doctype.
-  const body = await response.text();
-  const contentType = response.headers.get("content-type") ?? "unknown";
-  if (!body.trimStart().startsWith("{")) {
+  if (collected.size === 0) {
     throw new Error(
-      `Bulk price dump returned ${contentType} instead of JSON. ` +
-        `First bytes: ${body.slice(0, 160).replace(/\s+/g, " ")}`,
+      "Steam market search returned no usable prices; the server may be rate limited",
     );
   }
 
-  let data: Record<string, DumpEntry>;
-  try {
-    data = JSON.parse(body) as Record<string, DumpEntry>;
-  } catch (error) {
-    throw new Error(
-      `Bulk price dump is not valid JSON: ${(error as Error).message}`,
-    );
-  }
+  const prices = [...collected].map(([name, price]) => ({
+    name,
+    price,
+    source: "market-search",
+  }));
 
-  const prices: Array<{ name: string; price: number; source: string }> = [];
-
-  for (const [name, entry] of Object.entries(data)) {
-    const usd = pickSteamPrice(entry?.steam);
-    if (usd === undefined) continue;
-    // Round to cents so that the stored value matches what the market shows.
-    prices.push({
-      name,
-      price: Math.round(usd * rate * 100) / 100,
-      source: "bulk",
-    });
-  }
-
-  if (prices.length === 0) {
-    // Include one entry verbatim: if the provider changes the payout shape
-    // again, the log shows what to adapt the parser to.
-    const [sampleName, sampleEntry] = Object.entries(data)[0] ?? [];
-    throw new Error(
-      `Bulk price dump contained no usable Steam prices. ` +
-        `Sample entry "${sampleName}": ${JSON.stringify(sampleEntry).slice(0, 200)}`,
-    );
-  }
-
-  return { prices, rate, rateSource };
+  return { prices, rate, rateSource, url: SEARCH_URL };
 }
