@@ -86,6 +86,19 @@ db.exec(`
     updated_at    INTEGER NOT NULL
   );
 
+  CREATE TABLE IF NOT EXISTS steam_tags (
+    app_id     INTEGER PRIMARY KEY,
+    tag_ids    TEXT NOT NULL,
+    updated_at INTEGER NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS steam_tag_names (
+    tag_id   INTEGER NOT NULL,
+    language TEXT NOT NULL,
+    name     TEXT NOT NULL,
+    PRIMARY KEY (tag_id, language)
+  );
+
   CREATE TABLE IF NOT EXISTS tracked_games (
     app_id         INTEGER PRIMARY KEY,
     name           TEXT NOT NULL,
@@ -411,6 +424,24 @@ export interface HltbRecord {
   updatedAt: number;
 }
 
+export interface TagRecord {
+  appId: number;
+  /** Steam tag IDs, most agreed-upon first. Names are resolved separately. */
+  tagIds: number[];
+  updatedAt: number;
+}
+
+interface TagRow {
+  app_id: number;
+  tag_ids: string;
+  updated_at: number;
+}
+
+interface TagNameRow {
+  tag_id: number;
+  name: string;
+}
+
 interface ProfileRow {
   steam_id: string;
   persona_name: string;
@@ -487,6 +518,26 @@ const upsertHltbStmt = db.prepare(`
     matched       = excluded.matched,
     updated_at    = excluded.updated_at
 `);
+
+const upsertTagsStmt = db.prepare(`
+  INSERT INTO steam_tags (app_id, tag_ids, updated_at)
+  VALUES (?, ?, ?)
+  ON CONFLICT (app_id) DO UPDATE SET
+    tag_ids    = excluded.tag_ids,
+    updated_at = excluded.updated_at
+`);
+
+const selectTagNamesStmt = db.prepare<[string], TagNameRow>(
+  `SELECT tag_id, name FROM steam_tag_names WHERE language = ?`,
+);
+
+const deleteTagNamesStmt = db.prepare(
+  `DELETE FROM steam_tag_names WHERE language = ?`,
+);
+
+const insertTagNameStmt = db.prepare(
+  `INSERT INTO steam_tag_names (tag_id, language, name) VALUES (?, ?, ?)`,
+);
 
 const trackGameStmt = db.prepare(`
   INSERT INTO tracked_games (app_id, name, first_seen, last_requested)
@@ -656,6 +707,82 @@ export function upsertHltb(record: Omit<HltbRecord, "updatedAt">, updatedAt: num
     updatedAt,
   });
 }
+
+/** Chunked lookup for steam_tags, same reasoning as selectHltbStmt above. */
+const selectTagsStmts = new Map<number, Database.Statement<number[], TagRow>>();
+
+function selectTagsStmt(size: number): Database.Statement<number[], TagRow> {
+  let statement = selectTagsStmts.get(size);
+  if (!statement) {
+    const placeholders = new Array<string>(size).fill("?").join(",");
+    statement = db.prepare<number[], TagRow>(
+      `SELECT * FROM steam_tags WHERE app_id IN (${placeholders})`,
+    );
+    selectTagsStmts.set(size, statement);
+  }
+  return statement;
+}
+
+/**
+ * Reads cached tag IDs. A row whose JSON no longer parses is treated as absent
+ * rather than thrown: tags are decoration, and a damaged row should cause a
+ * refetch, not a failed library request.
+ */
+export function getTagsFor(appIds: number[]): Map<number, TagRecord> {
+  const result = new Map<number, TagRecord>();
+  const chunkSize = 400;
+  for (let i = 0; i < appIds.length; i += chunkSize) {
+    const chunk = appIds.slice(i, i + chunkSize);
+    for (const row of selectTagsStmt(chunk.length).all(...chunk)) {
+      let tagIds: number[];
+      try {
+        const parsed: unknown = JSON.parse(row.tag_ids);
+        if (!Array.isArray(parsed)) continue;
+        tagIds = parsed.filter(
+          (value): value is number => typeof value === "number",
+        );
+      } catch {
+        continue;
+      }
+      result.set(row.app_id, {
+        appId: row.app_id,
+        tagIds,
+        updatedAt: row.updated_at,
+      });
+    }
+  }
+  return result;
+}
+
+/** Writes a batch of tag lists. An empty list is a real answer and is stored. */
+export const upsertTags = db.transaction(
+  (records: Array<{ appId: number; tagIds: number[] }>, updatedAt: number) => {
+    for (const record of records) {
+      upsertTagsStmt.run(record.appId, JSON.stringify(record.tagIds), updatedAt);
+    }
+  },
+);
+
+export function getTagNames(language: string): Map<number, string> {
+  const names = new Map<number, string>();
+  for (const row of selectTagNamesStmt.all(language)) {
+    names.set(row.tag_id, row.name);
+  }
+  return names;
+}
+
+/**
+ * Replaces the vocabulary for one language wholesale. Steam's list is the
+ * authority, so merging would only keep tags it has retired.
+ */
+export const replaceTagNames = db.transaction(
+  (language: string, names: ReadonlyMap<number, string>) => {
+    deleteTagNamesStmt.run(language);
+    for (const [tagId, name] of names) {
+      insertTagNameStmt.run(tagId, language, name);
+    }
+  },
+);
 
 /** Records games as worth looking up, refreshing their last requested stamp. */
 export const trackGames = db.transaction(

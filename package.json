@@ -11,7 +11,7 @@
     "start": "node dist/server.js",
     "dev": "tsx watch src/server.ts",
     "refresh": "tsx src/cli-refresh.ts",
-    "test": "node --import tsx --test src/steamRef.test.ts src/session.test.ts src/sources/howLongToBeat.test.ts",
+    "test": "node --import tsx --test src/steamRef.test.ts src/session.test.ts src/sources/howLongToBeat.test.ts src/sources/steamStore.test.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

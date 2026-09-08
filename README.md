@@ -117,6 +117,27 @@ records those games, and a background worker fills them in — the same
 demand-driven shape as pricing. The frontend polls until nothing is pending.
 At the default settings a 500-game library completes in roughly 25 minutes.
 
+### Why the tags do not
+
+Store tags look like a second case of the same problem and are not one. They
+come from the API the Steam store front-end itself calls, which answers **200
+AppIDs in about half a second** — a 500-game library is three requests and
+roughly a second and a half, so tags are resolved inside the library request
+with no worker, no queue and nothing to poll.
+
+The endpoint is undocumented and needs no API key. That combination argues for
+treating tags as a garnish everywhere: a failure empties the field and is
+logged, but never fails the library request, and `STORE_TAGS_ENABLED=false`
+turns the whole thing off with the same visible result. Tag names are localised
+and cached per language; the vocabulary is one 16 kB request for about 450
+tags, refreshed monthly and skipped entirely when Steam's `version_hash` has
+not moved.
+
+It is GET-only, and the request is a JSON blob in a query parameter, so the
+batch ceiling is URL length rather than a documented item count: 240 AppIDs
+still answer, 300 come back `414 URI Too Long`. `STORE_TAG_BATCH_SIZE` defaults
+to 200 and is clamped to 240 in code.
+
 ## How a request flows
 
 ```
@@ -148,6 +169,8 @@ GET /api/steam/library/:ref
   |- library     SQLite cache hit? -> use it, otherwise GetOwnedGames
   |- tracking    every AppID is recorded for the completion-time worker
   |- times       bulk SELECT from hltb_games; unknown games stay null
+  |- tags        cached tag IDs; missing ones fetched now, 200 AppIDs a request
+  |              (failure here empties the field, it never fails the request)
   |- kick        worker started in the background if anything is pending
   |- JSON response, immediately
 ```
@@ -281,6 +304,12 @@ them. The ones you are most likely to change:
 | `HLTB_BATCH_SIZE`                | `40`       | Games per worker cycle. Batch × delay should fit the interval.   |
 | `HLTB_DELAY_MS`                  | `3000`     | Delay between HowLongToBeat requests.                            |
 | `HLTB_MAX_AGE_DAYS`              | `90`       | Completion times barely change.                                  |
+| `STORE_TAGS_ENABLED`             | `true`     | Emergency switch for all store tag traffic.                      |
+| `STORE_TAG_LANGUAGE`             | `german`   | Tag names are localised and cached per language.                 |
+| `STORE_TAGS_PER_GAME`            | `6`        | Top N tags, in Steam's own agreement order.                      |
+| `STORE_TAG_BATCH_SIZE`           | `200`      | AppIDs per request. Clamped to 240: above that Steam answers 414.|
+| `STORE_TAG_MAX_AGE_DAYS`         | `30`       | Tags drift slowly; a game does not change genre.                 |
+| `STORE_TAG_BUDGET_MS`            | `8000`     | Time tags may spend in one request before the rest waits.        |
 
 Invalid or missing critical values abort startup rather than failing later at
 request time. Two exceptions are deliberate: `STEAM_API_KEY` and
@@ -501,6 +530,11 @@ listed after each run.
   ambiguous. A game whose Steam and HowLongToBeat names differ in an unusual way
   can end up unmatched rather than wrong, which is the intended failure
   direction.
+- The store tag lookup is likewise undocumented, and unlike the price and
+  completion-time paths it needs no API key at all. When it breaks, games come
+  back with empty tag lists and the response says so in `tags.known`; nothing
+  else is affected. `STORE_TAGS_ENABLED=false` produces the same result on
+  purpose.
 - Reading a library needs the account's **game details** to be public, which is
   a different Steam setting from the profile being public.
 - The Steam Web API allows 100,000 calls per day per key. Libraries are cached
@@ -519,6 +553,7 @@ src/
   throttle.ts          Serialised request queue with a circuit breaker
   prices.ts            Price cache: refresh cycle, lookups, fee maths
   hltb.ts              Completion-time cache: refresh cycle and worker
+  storeTags.ts         Store tag cache and vocabulary; fails quietly by design
   steamHeaders.ts      The client identity every steamcommunity request sends
   steamInventory.ts    Inventory fetch, pagination, aggregation, cache
   steamLibrary.ts      Profile + owned games + cached times, and the caches
@@ -529,6 +564,7 @@ src/
     steamMarket.ts     Throttled priceoverview lookups
     steamWebApi.ts     ResolveVanityURL, GetPlayerSummaries, GetOwnedGames
     howLongToBeat.ts   Token flow, search, and title matching
+    steamStore.ts      Batched store tag lookups and the tag vocabulary
   *.test.ts            Unit tests for the pure parts (node:test)
 apps-script/Code.gs    Example Google Sheets client
 deploy/                systemd unit

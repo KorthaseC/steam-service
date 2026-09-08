@@ -21,6 +21,7 @@ import {
   type OwnedGame,
 } from "./sources/steamWebApi.js";
 import type { SteamRef } from "./steamRef.js";
+import { tagsFor } from "./storeTags.js";
 
 /**
  * Puts a Steam profile, its library and the cached HowLongToBeat times into the
@@ -42,6 +43,12 @@ export interface LibraryGame {
   lastPlayed: string | null;
   /** null means "not looked up yet", which the UI shows as a skeleton. */
   hltb: GameTimes | null;
+  /**
+   * Steam store tags, most agreed-upon first, already resolved to display
+   * names in the configured language. Empty when Steam knows none for this
+   * game or the lookup was unavailable - see `tags` on the response for which.
+   */
+  tags: string[];
 }
 
 export interface GameTimes {
@@ -51,6 +58,16 @@ export interface GameTimes {
   completionist: number | null;
   /** False means HowLongToBeat was searched and knows no such game. */
   matched: boolean;
+}
+
+/**
+ * How much of the library carries tags. Unlike the completion times this is not
+ * progress to poll on - tags arrive with the response - it exists so the UI can
+ * tell "this game has no tags" from "tags could not be loaded at all".
+ */
+export interface TagCoverage {
+  total: number;
+  known: number;
 }
 
 export interface HltbProgress {
@@ -73,6 +90,7 @@ export interface LibraryResponse {
   };
   games: LibraryGame[];
   hltb: HltbProgress;
+  tags: TagCoverage;
   meta: { libraryFetchedAt: string; fromCache: boolean };
 }
 
@@ -259,6 +277,12 @@ export async function loadLibrary(
   const appIds = games.map((game) => game.appId);
   const known = getHltbFor(appIds);
 
+  // Tags come back with this response rather than through the polling
+  // companion: a batch of 200 answers in about half a second, so even a large
+  // library is a couple of requests. The call never rejects - a store outage
+  // costs the tag filter, not the library.
+  const tagFill = await tagsFor(appIds);
+
   const entries: LibraryGame[] = games
     .map((game) => {
       const record = known.get(game.appId);
@@ -271,6 +295,7 @@ export async function loadLibrary(
           ? new Date(game.lastPlayed * 1000).toISOString()
           : null,
         hltb: record ? toTimes(record) : null,
+        tags: tagFill.tags.get(game.appId) ?? [],
       };
     })
     .sort((a, b) => b.playtimeMinutes - a.playtimeMinutes);
@@ -290,6 +315,7 @@ export async function loadLibrary(
     },
     games: entries,
     hltb,
+    tags: { total: appIds.length, known: tagFill.known },
     meta: {
       libraryFetchedAt: new Date(fetchedAt).toISOString(),
       fromCache,

@@ -224,6 +224,37 @@ export const config = {
     "https://shared.fastly.steamstatic.com/store_item_assets/steam/apps",
   ),
 
+  // --- Store tags --------------------------------------------------------
+  /**
+   * Emergency switch, like hltbEnabled: the tag endpoint is undocumented and
+   * could start refusing at any time. Off means games come back with no tags
+   * and the library keeps working.
+   */
+  storeTagsEnabled: bool("STORE_TAGS_ENABLED", true),
+  /** Tag names are localised; the cache is keyed by this value. */
+  storeTagLanguage: str("STORE_TAG_LANGUAGE", "german"),
+  storeTagCountry: str("STORE_TAG_COUNTRY", "DE"),
+  /** Top N tags per game, Steam's own ordering (most agreed-upon first). */
+  storeTagsPerGame: num("STORE_TAGS_PER_GAME", 6),
+  /**
+   * AppIDs per request. The request is a JSON blob in a query parameter, so
+   * the real limit is URL length: 240 still answers, 300 comes back 414.
+   */
+  storeTagBatchSize: num("STORE_TAG_BATCH_SIZE", 200),
+  /**
+   * How long before a game's tags are looked up again. Tags drift slowly - a
+   * game does not change genre - so this is generous.
+   */
+  storeTagMaxAgeDays: num("STORE_TAG_MAX_AGE_DAYS", 30),
+  /** The tag vocabulary itself changes even more rarely than a game's tags. */
+  storeTagListMaxAgeDays: num("STORE_TAG_LIST_MAX_AGE_DAYS", 30),
+  /**
+   * Wall clock budget for filling tags during one library request. Tags are
+   * never worth making somebody wait: whatever is not fetched inside the
+   * budget stays uncached and is picked up on the next load.
+   */
+  storeTagBudgetMs: num("STORE_TAG_BUDGET_MS", 8000),
+
   // --- HowLongToBeat -----------------------------------------------------
   /** Emergency switch, for when HowLongToBeat closes the door on scraping. */
   hltbEnabled: bool("HLTB_ENABLED", true),

@@ -19,6 +19,9 @@ Two conventions that are easy to get wrong:
   nobody has looked this game up yet — show a skeleton, and expect it to be
   filled in by polling. `matched: false` means HowLongToBeat was searched and
   knows no such game — show "no data" and stop waiting.
+- **Tags are not a loading phase.** `hltb` fills in over minutes; `tags` arrives
+  complete with the first response. Do not build a polling or skeleton path for
+  it — see _Store tags_ below.
 
 ## Authentication
 
@@ -97,6 +100,7 @@ back with `hltb: null` and are queued for the background worker.
         "completionist": 1377,
         "matched": true,
       },
+      "tags": ["Rätsel", "Sci-Fi", "Komödie", "Erstperson", "Koop"],
     },
     {
       "appId": 12345,
@@ -105,6 +109,7 @@ back with `hltb: null` and are queued for the background worker.
       "playtimeMinutes": 0,
       "lastPlayed": null,
       "hltb": null, // not looked up yet -> poll
+      "tags": [], // no tags known - see the `tags` block below
     },
   ],
   "hltb": {
@@ -113,6 +118,10 @@ back with `hltb: null` and are queued for the background worker.
     "unmatched": 22, // searched, no such game
     "pending": 121, // still to do -> keep polling
     "blocked": false, // true: HLTB is refusing, progress stalled
+  },
+  "tags": {
+    "total": 512,
+    "known": 512, // games whose tags are settled; not something to poll on
   },
   "meta": {
     "libraryFetchedAt": "2026-09-06T10:15:21.000Z",
@@ -123,6 +132,41 @@ back with `hltb: null` and are queued for the background worker.
 
 Games are sorted by playtime descending. Sort them however you like in the UI;
 the order is only there to make the payload stable.
+
+#### Store tags
+
+`tags` on each game is the Steam store's user tags, already resolved to display
+names in the server's configured language (German by default, set through
+`STORE_TAG_LANGUAGE`). **The order is Steam's own** — most agreed-upon tag
+first — so take the first few rather than sorting alphabetically; the ordering
+is the signal. There are at most `STORE_TAGS_PER_GAME` of them, six by default.
+
+**Tags are not a second loading phase.** This is the important difference from
+the completion times, and it is worth being explicit because the two look
+superficially alike. Tags come back complete with the first response: the store
+endpoint answers 200 AppIDs in roughly half a second, so a 500-game library is
+three requests and about a second and a half. There is no worker, nothing to
+poll, and no skeleton state. `GET /api/steam/library/:ref/hltb` deliberately
+does **not** carry tags.
+
+`tags: []` means no tags are known for that game. There is no `null` variant,
+because unlike `hltb` there is no in-between state worth rendering differently.
+Two things produce an empty list and the per-game field cannot tell them apart:
+
+- The game genuinely carries no store tags, or Steam has delisted it. About 2%
+  of a typical library.
+- The tag lookup was unavailable when the library was built.
+
+That is what the top-level `tags` block is for. `known` counts the games whose
+tags are settled, `total` is the library size. When `known` is 0 on a library of
+any size, the lookup failed rather than every game being untagged — worth saying
+so instead of showing an empty filter. A partial `known` is normal and needs no
+message: the remaining games fill in on the next load.
+
+The underlying endpoint is undocumented — it is the API the Steam store front-end
+itself calls — so it can start refusing at any time. A failure there never fails
+the library request; it only empties this field. The server can also be run with
+`STORE_TAGS_ENABLED=false`, which has exactly the same visible effect.
 
 ### `GET /api/steam/library/:ref/hltb`
 
