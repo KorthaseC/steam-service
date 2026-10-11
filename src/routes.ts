@@ -1,4 +1,4 @@
-import { Router } from "express";
+import { Router, type Request } from "express";
 import rateLimit from "express-rate-limit";
 import {
   clientIpKey,
@@ -19,7 +19,13 @@ import {
 import { sessionCookie, signSession } from "./session.js";
 import { SteamApiError } from "./sources/steamWebApi.js";
 import { getInventory, InventoryError } from "./steamInventory.js";
-import { loadHltbProgress, loadLibrary } from "./steamLibrary.js";
+import {
+  hideLibraryGame,
+  loadHltbProgress,
+  loadLibrary,
+  unhideAllLibraryGames,
+  unhideLibraryGame,
+} from "./steamLibrary.js";
 import { parseSteamRef } from "./steamRef.js";
 import { toCsv, valueInventory } from "./valuation.js";
 
@@ -125,6 +131,28 @@ const INVALID_REF = {
     "Expected a SteamID64, a steamcommunity.com profile link or a vanity name",
 };
 
+const INVALID_APP_ID = {
+  error: "invalid_app_id",
+  message: "Expected a positive numeric AppID",
+};
+
+/**
+ * Who is asking, for everything stored per caller. The label of the access
+ * code or guest key - `session:chris`, `sheet` - rather than anything about the
+ * browser, so hidden games follow a person across devices. Two people sharing
+ * one code share one list, which is the price of having no accounts.
+ */
+function ownerOf(req: Request): string | null {
+  return req.auth?.label ?? null;
+}
+
+/** AppIDs are positive integers; anything else never reaches the database. */
+function parseAppId(raw: string | undefined): number | null {
+  if (!raw || !/^\d{1,10}$/.test(raw)) return null;
+  const appId = Number(raw);
+  return Number.isSafeInteger(appId) && appId > 0 ? appId : null;
+}
+
 /** Public liveness probe. Deliberately reveals nothing beyond service state. */
 router.get("/health", (_req, res) => {
   const status = priceStoreStatus();
@@ -222,12 +250,10 @@ router.post("/prices/lookup", requireAdmin, adminLimiter, async (req, res) => {
     return;
   }
   if (body.names.length > 500) {
-    res
-      .status(413)
-      .json({
-        error: "too_many_names",
-        message: "At most 500 names per request",
-      });
+    res.status(413).json({
+      error: "too_many_names",
+      message: "At most 500 names per request",
+    });
     return;
   }
 
@@ -353,6 +379,11 @@ router.delete("/auth/session", (_req, res) => {
  * Answers immediately: games nobody has looked up yet come back with a null
  * hltb field and are queued for the background worker. The companion endpoint
  * below is what the frontend polls until nothing is pending.
+ *
+ * `?refresh=1` reads profile and games from Steam instead of the cache, at
+ * most once per LIBRARY_REFRESH_COOLDOWN_SECONDS per SteamID. It is not a
+ * privilege: guests may use it, because the cooldown bounds the cost no matter
+ * who asks, and a request inside the cooldown is simply served from the cache.
  */
 router.get(
   "/steam/library/:ref",
@@ -368,8 +399,16 @@ router.get(
       return;
     }
 
+    const owner = ownerOf(req);
+    if (!owner) {
+      res.status(401).json({ error: "missing_api_key" });
+      return;
+    }
+
+    const refresh = req.query.refresh === "1";
+
     try {
-      res.json(await loadLibrary(ref, raw));
+      res.json(await loadLibrary(ref, raw, owner, refresh));
     } catch (error) {
       const { status, body } = handleSteamError(error);
       res.status(status).json(body);
@@ -392,8 +431,109 @@ router.get(
       return;
     }
 
+    const owner = ownerOf(req);
+    if (!owner) {
+      res.status(401).json({ error: "missing_api_key" });
+      return;
+    }
+
     try {
-      res.json(await loadHltbProgress(ref));
+      res.json(await loadHltbProgress(ref, owner));
+    } catch (error) {
+      const { status, body } = handleSteamError(error);
+      res.status(status).json(body);
+    }
+  },
+);
+
+/**
+ * Hides one game from the caller's view of this library, permanently until it
+ * is shown again. Idempotent. Answers with the caller's updated hidden list.
+ *
+ * Safe to expose to guests on a cookie session: the cookie is SameSite=Lax, so
+ * a cross-site PUT or DELETE never carries it, and the API sends no CORS
+ * headers that would let another origin try.
+ */
+router.put(
+  "/steam/library/:ref/hidden/:appId",
+  requireGuest,
+  libraryLimiter,
+  async (req, res) => {
+    const ref = parseSteamRef(req.params.ref);
+    if (!ref) {
+      res.status(400).json(INVALID_REF);
+      return;
+    }
+    const appId = parseAppId(req.params.appId);
+    if (appId === null) {
+      res.status(400).json(INVALID_APP_ID);
+      return;
+    }
+    const owner = ownerOf(req);
+    if (!owner) {
+      res.status(401).json({ error: "missing_api_key" });
+      return;
+    }
+
+    try {
+      res.json({ hidden: await hideLibraryGame(ref, owner, appId) });
+    } catch (error) {
+      const { status, body } = handleSteamError(error);
+      res.status(status).json(body);
+    }
+  },
+);
+
+/** Shows one hidden game again. Idempotent. */
+router.delete(
+  "/steam/library/:ref/hidden/:appId",
+  requireGuest,
+  libraryLimiter,
+  async (req, res) => {
+    const ref = parseSteamRef(req.params.ref);
+    if (!ref) {
+      res.status(400).json(INVALID_REF);
+      return;
+    }
+    const appId = parseAppId(req.params.appId);
+    if (appId === null) {
+      res.status(400).json(INVALID_APP_ID);
+      return;
+    }
+    const owner = ownerOf(req);
+    if (!owner) {
+      res.status(401).json({ error: "missing_api_key" });
+      return;
+    }
+
+    try {
+      res.json({ hidden: await unhideLibraryGame(ref, owner, appId) });
+    } catch (error) {
+      const { status, body } = handleSteamError(error);
+      res.status(status).json(body);
+    }
+  },
+);
+
+/** Shows every game the caller has hidden in this library again. */
+router.delete(
+  "/steam/library/:ref/hidden",
+  requireGuest,
+  libraryLimiter,
+  async (req, res) => {
+    const ref = parseSteamRef(req.params.ref);
+    if (!ref) {
+      res.status(400).json(INVALID_REF);
+      return;
+    }
+    const owner = ownerOf(req);
+    if (!owner) {
+      res.status(401).json({ error: "missing_api_key" });
+      return;
+    }
+
+    try {
+      res.json({ hidden: await unhideAllLibraryGames(ref, owner) });
     } catch (error) {
       const { status, body } = handleSteamError(error);
       res.status(status).json(body);
@@ -416,16 +556,21 @@ router.get("/steam/status", requireAdmin, adminLimiter, (_req, res) => {
 });
 
 /** Forces a completion time cycle outside the normal schedule. */
-router.post("/admin/refresh-hltb", requireAdmin, adminLimiter, async (_req, res) => {
-  try {
-    const result = await refreshHltb();
-    res.json({ ok: true, ...result });
-  } catch (error) {
-    res
-      .status(502)
-      .json({ error: "refresh_failed", message: (error as Error).message });
-  }
-});
+router.post(
+  "/admin/refresh-hltb",
+  requireAdmin,
+  adminLimiter,
+  async (_req, res) => {
+    try {
+      const result = await refreshHltb();
+      res.json({ ok: true, ...result });
+    } catch (error) {
+      res
+        .status(502)
+        .json({ error: "refresh_failed", message: (error as Error).message });
+    }
+  },
+);
 
 /** Detailed store status, including the list of configured guest key labels. */
 router.get("/admin/status", requireAdmin, adminLimiter, (_req, res) => {

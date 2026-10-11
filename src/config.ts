@@ -64,21 +64,54 @@ function parseGuestKeys(raw: string): Map<string, string> {
  * be readable and typed by hand; the login endpoint carries its own strict rate
  * limit to make up for the smaller search space. See the security section of
  * the README before lowering this further.
+ *
+ * Code and label are trimmed individually. The login form trims what a person
+ * types, so a stray space before the colon ("code :label") would otherwise
+ * become part of a code that no login can ever match - and the only symptom
+ * would be "invalid access code" for a code that looks right in the file.
+ *
+ * An entry without a colon is still accepted under the label "unnamed", so an
+ * existing configuration keeps starting, but it is logged: it is usually a
+ * forgotten label or a value the env file parser cut short, and the log line
+ * is the only place that shows up before a login fails.
  */
 function parseAccessCodes(raw: string): Map<string, string> {
   const codes = new Map<string, string>();
-  for (const entry of raw.split(",")) {
+  for (const [index, entry] of raw.split(",").entries()) {
     const trimmed = entry.trim();
     if (!trimmed) continue;
+
     const separator = trimmed.indexOf(":");
-    const code = separator === -1 ? trimmed : trimmed.slice(0, separator);
-    const label = separator === -1 ? "unnamed" : trimmed.slice(separator + 1);
+    if (separator === -1) {
+      console.warn(
+        `[config] ACCESS_CODES entry ${index + 1} has no ":label" part and is filed as "unnamed". ` +
+          `Expected code:label - if the code contains "#", the value may have been cut short there`,
+      );
+    }
+
+    const code = (
+      separator === -1 ? trimmed : trimmed.slice(0, separator)
+    ).trim();
+    const label =
+      (separator === -1 ? "" : trimmed.slice(separator + 1).trim()) ||
+      "unnamed";
+
     if (code.length < 12) {
       throw new Error(
         `Access code "${label}" is shorter than 12 characters and would be guessable`,
       );
     }
-    codes.set(code, label || "unnamed");
+
+    const existing = codes.get(code);
+    if (existing !== undefined) {
+      // Not fatal, but worth a line: only one of the two labels can win, and
+      // a session would carry a name the person did not expect.
+      console.warn(
+        `[config] ACCESS_CODES lists the same code for "${existing}" and "${label}"; "${label}" is used`,
+      );
+    }
+
+    codes.set(code, label);
   }
   return codes;
 }
@@ -213,22 +246,59 @@ export const config = {
   steamApiKey,
   /** A library changes far less often than a price, so it is cached longer. */
   libraryCacheMinutes: num("LIBRARY_CACHE_MINUTES", 60),
+  /** How long a public profile is served from the cache. */
   profileCacheMinutes: num("PROFILE_CACHE_MINUTES", 60),
+  /**
+   * How long a private profile is remembered as private. Kept short on
+   * purpose: somebody who has just switched their profile to public should
+   * see it work on the next try, not after the full profile cache lifetime.
+   * The few seconds exist only so a reload loop does not hit the Web API on
+   * every single request.
+   */
+  privateProfileCacheSeconds: num("PRIVATE_PROFILE_CACHE_SECONDS", 20),
+  /**
+   * Minimum gap between two forced refreshes (`?refresh=1`) of the same
+   * SteamID. A forced refresh bypasses the profile and library caches, so
+   * this is what keeps a refresh button from turning into an API key drain.
+   * Requests inside the gap are answered normally, from the cache.
+   */
+  libraryRefreshCooldownSeconds: num("LIBRARY_REFRESH_COOLDOWN_SECONDS", 60),
   vanityCacheHours: num("VANITY_CACHE_HOURS", 24),
   /**
    * Capsule images come straight from Steam's CDN. Kept configurable because
    * Steam has moved this host twice and a broken image is otherwise a redeploy.
+   *
+   * This one builds the image URL from the AppID alone, which only works for
+   * older store art. It is the fallback for games whose real path the store
+   * lookup did not deliver; see storeAssetBase.
    */
   steamCapsuleBase: str(
     "STEAM_CAPSULE_BASE",
     "https://shared.fastly.steamstatic.com/store_item_assets/steam/apps",
-  ),
+  ).replace(/\/+$/, ""),
+  /**
+   * Host for the image paths the store lookup reports, which already start
+   * with `steam/apps/<appid>/` and include the content hash newer art needs.
+   */
+  storeAssetBase: str(
+    "STORE_ASSET_BASE",
+    "https://shared.fastly.steamstatic.com/store_item_assets",
+  ).replace(/\/+$/, ""),
+  /**
+   * Square community icons, addressed by the hash GetOwnedGames returns. The
+   * last resort for a game with no usable capsule - usually one that has left
+   * the store, which is exactly when the store lookup knows nothing about it.
+   */
+  steamCommunityIconBase: str(
+    "STEAM_COMMUNITY_ICON_BASE",
+    "https://media.steampowered.com/steamcommunity/public/images/apps",
+  ).replace(/\/+$/, ""),
 
   // --- Store tags --------------------------------------------------------
   /**
-   * Emergency switch, like hltbEnabled: the tag endpoint is undocumented and
-   * could start refusing at any time. Off means games come back with no tags
-   * and the library keeps working.
+   * Emergency switch, like hltbEnabled: the store endpoint is undocumented and
+   * could start refusing at any time. Off means games come back with no tags,
+   * no review summary and derived image URLs, and the library keeps working.
    */
   storeTagsEnabled: bool("STORE_TAGS_ENABLED", true),
   /** Tag names are localised; the cache is keyed by this value. */
@@ -246,6 +316,12 @@ export const config = {
    * game does not change genre - so this is generous.
    */
   storeTagMaxAgeDays: num("STORE_TAG_MAX_AGE_DAYS", 30),
+  /**
+   * How long before a game's review summary is looked up again. Reviews move
+   * faster than tags, and both come from the same call, so a game's store
+   * details are refreshed at whichever of the two limits is shorter.
+   */
+  storeReviewMaxAgeDays: num("STORE_REVIEW_MAX_AGE_DAYS", 7),
   /** The tag vocabulary itself changes even more rarely than a game's tags. */
   storeTagListMaxAgeDays: num("STORE_TAG_LIST_MAX_AGE_DAYS", 30),
   /**

@@ -1,26 +1,30 @@
 import { config } from "./config.js";
 import {
   getMeta,
+  getStoreDetailsFor,
   getTagNames,
-  getTagsFor,
   replaceTagNames,
   setMeta,
-  upsertTags,
+  upsertStoreDetails,
 } from "./db.js";
 import {
   chunkAppIds,
-  fetchTagIds,
+  fetchStoreItems,
   fetchTagList,
   resolveTagNames,
+  type StoreItemDetails,
+  type StoreReviewSummary,
 } from "./sources/steamStore.js";
 
 /**
- * Keeps store tags for a library current, and turns them into display names.
+ * Keeps a library's store details current: tags as display names, the review
+ * summary, and the path of each game's capsule image.
  *
- * The governing rule is that tags are a garnish. Every path in here is allowed
- * to give up quietly: an undocumented endpoint that starts refusing must cost
- * the reader their tag filter, never their library. Nothing in this module
- * throws, and `tagsFor` returns whatever it managed to assemble.
+ * The governing rule is that all of it is a garnish. Every path in here is
+ * allowed to give up quietly: an undocumented endpoint that starts refusing
+ * must cost the reader their tag filter, ratings and exact images, never their
+ * library. Nothing in this module throws, and `storeDetailsFor` returns
+ * whatever it managed to assemble.
  *
  * Unlike the completion times there is no worker and no polling. A batch of 200
  * AppIDs answers in about half a second, so even a very large library fills
@@ -31,10 +35,19 @@ import {
 const LIST_FETCHED_KEY = `store_tag_list_fetched_at:${config.storeTagLanguage}`;
 const LIST_HASH_KEY = `store_tag_list_hash:${config.storeTagLanguage}`;
 
-export interface TagFill {
-  /** AppID to display names, most agreed-upon tag first. */
-  tags: Map<number, string[]>;
-  /** Games whose tags are known, for the summary the frontend renders. */
+/** What the library payload needs for one game. */
+export interface GameStoreDetails {
+  /** Display names, most agreed-upon tag first. */
+  tags: string[];
+  reviews: StoreReviewSummary | null;
+  /** Relative to the store asset host; null when the store sent none. */
+  capsulePath: string | null;
+}
+
+export interface StoreDetailsFill {
+  /** Only games whose details are known; absent means "could not be loaded". */
+  details: Map<number, GameStoreDetails>;
+  /** Games whose details are known, for the summary the frontend renders. */
   known: number;
 }
 
@@ -45,6 +58,20 @@ function namesAreStale(): boolean {
   const fetchedAt = Number(getMeta(LIST_FETCHED_KEY) ?? 0);
   if (!Number.isFinite(fetchedAt) || fetchedAt <= 0) return true;
   return Date.now() - fetchedAt > config.storeTagListMaxAgeDays * 86_400_000;
+}
+
+/**
+ * A record is refreshed at the shorter of the two lifetimes. Tags and reviews
+ * come from the same call, so there is nothing to gain from ageing them
+ * separately - and a batch of 200 is cheap enough that refreshing tags a little
+ * more often than they need is not worth a second code path.
+ */
+function detailsMaxAgeMs(): number {
+  const days = Math.min(
+    config.storeTagMaxAgeDays,
+    config.storeReviewMaxAgeDays,
+  );
+  return Math.max(0, days) * 86_400_000;
 }
 
 /**
@@ -87,25 +114,30 @@ async function ensureTagNames(): Promise<Map<number, string>> {
     cachedNames = list.names;
     return list.names;
   } catch (error) {
-    console.warn(`[tags] tag list refresh failed: ${(error as Error).message}`);
+    console.warn(
+      `[store] tag list refresh failed: ${(error as Error).message}`,
+    );
     cachedNames = stored;
     return stored;
   }
 }
 
 /**
- * Assembles tags for a set of games, fetching the ones that are missing or
- * stale within the wall clock budget.
+ * Assembles store details for a set of games, fetching the ones that are
+ * missing or stale within the wall clock budget. A stale record is still used
+ * until its replacement arrives.
  */
-export async function tagsFor(appIds: number[]): Promise<TagFill> {
-  const tags = new Map<number, string[]>();
+export async function storeDetailsFor(
+  appIds: number[],
+): Promise<StoreDetailsFill> {
+  const details = new Map<number, GameStoreDetails>();
   if (!config.storeTagsEnabled || appIds.length === 0) {
-    return { tags, known: 0 };
+    return { details, known: 0 };
   }
 
   const names = await ensureTagNames();
-  const cached = getTagsFor(appIds);
-  const maxAgeMs = config.storeTagMaxAgeDays * 86_400_000;
+  const cached = getStoreDetailsFor(appIds);
+  const maxAgeMs = detailsMaxAgeMs();
   const now = Date.now();
 
   const missing: number[] = [];
@@ -115,17 +147,28 @@ export async function tagsFor(appIds: number[]): Promise<TagFill> {
       missing.push(appId);
       continue;
     }
-    tags.set(appId, resolveTagNames(record.tagIds, names));
+    details.set(appId, toGameDetails(record, names));
     if (now - record.updatedAt > maxAgeMs) missing.push(appId);
   }
 
   if (missing.length > 0) {
-    await fillMissing(missing, tags, names);
+    await fillMissing(missing, details, names);
   }
 
-  // A game can legitimately carry no tags, so "known" counts entries present
-  // rather than entries that are non-empty.
-  return { tags, known: tags.size };
+  // A game can legitimately carry no tags and no reviews, so "known" counts
+  // entries present rather than entries that have content.
+  return { details, known: details.size };
+}
+
+function toGameDetails(
+  record: Pick<StoreItemDetails, "tagIds" | "reviews" | "capsulePath">,
+  names: ReadonlyMap<number, string>,
+): GameStoreDetails {
+  return {
+    tags: resolveTagNames(record.tagIds, names),
+    reviews: record.reviews,
+    capsulePath: record.capsulePath,
+  };
 }
 
 /**
@@ -138,7 +181,7 @@ export async function tagsFor(appIds: number[]): Promise<TagFill> {
  */
 async function fillMissing(
   missing: number[],
-  tags: Map<number, string[]>,
+  details: Map<number, GameStoreDetails>,
   names: ReadonlyMap<number, string>,
 ): Promise<void> {
   const deadline = Date.now() + config.storeTagBudgetMs;
@@ -147,34 +190,39 @@ async function fillMissing(
   for (const batch of batches) {
     if (Date.now() > deadline) {
       console.warn(
-        `[tags] budget spent with ${batches.length} batches planned; the rest fill on the next load`,
+        `[store] budget spent with ${batches.length} batches planned; the rest fill on the next load`,
       );
       break;
     }
 
-    let fetched: Map<number, number[]>;
+    let fetched: Map<number, StoreItemDetails>;
     try {
-      fetched = await fetchTagIds(batch);
+      fetched = await fetchStoreItems(batch);
     } catch (error) {
-      console.warn(`[tags] lookup failed: ${(error as Error).message}`);
+      console.warn(`[store] lookup failed: ${(error as Error).message}`);
       break;
     }
 
-    const records: Array<{ appId: number; tagIds: number[] }> = [];
-    for (const [appId, tagIds] of fetched) {
-      records.push({ appId, tagIds });
-      tags.set(appId, resolveTagNames(tagIds, names));
+    const records: Array<{ appId: number } & StoreItemDetails> = [];
+    for (const [appId, item] of fetched) {
+      records.push({ appId, ...item });
+      details.set(appId, toGameDetails(item, names));
     }
 
     // Apps Steam did not answer for - delisted, region locked - are recorded
-    // with no tags so the next load does not ask about them again.
+    // empty so the next load does not ask about them again.
     for (const appId of batch) {
       if (!fetched.has(appId)) {
-        records.push({ appId, tagIds: [] });
-        tags.set(appId, []);
+        const empty: StoreItemDetails = {
+          tagIds: [],
+          reviews: null,
+          capsulePath: null,
+        };
+        records.push({ appId, ...empty });
+        details.set(appId, toGameDetails(empty, names));
       }
     }
 
-    if (records.length > 0) upsertTags(records, Date.now());
+    if (records.length > 0) upsertStoreDetails(records, Date.now());
   }
 }

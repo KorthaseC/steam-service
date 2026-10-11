@@ -1,5 +1,6 @@
 import Database from "better-sqlite3";
 import { config } from "./config.js";
+import type { StoreReviewSummary } from "./sources/steamStore.js";
 
 /**
  * SQLite is used as a local cache so that no user request ever has to wait for
@@ -86,17 +87,36 @@ db.exec(`
     updated_at    INTEGER NOT NULL
   );
 
-  CREATE TABLE IF NOT EXISTS steam_tags (
-    app_id     INTEGER PRIMARY KEY,
-    tag_ids    TEXT NOT NULL,
-    updated_at INTEGER NOT NULL
+  CREATE TABLE IF NOT EXISTS store_details (
+    app_id       INTEGER PRIMARY KEY,
+    tag_ids      TEXT NOT NULL,
+    reviews      TEXT,
+    capsule_path TEXT,
+    updated_at   INTEGER NOT NULL
   );
+
+  -- Superseded by store_details, which carries reviews and image paths as well.
+  -- Its rows cannot be carried over - they lack both - and every game in a
+  -- library is refetched on its next load anyway, three requests for 500 games.
+  DROP TABLE IF EXISTS steam_tags;
 
   CREATE TABLE IF NOT EXISTS steam_tag_names (
     tag_id   INTEGER NOT NULL,
     language TEXT NOT NULL,
     name     TEXT NOT NULL,
     PRIMARY KEY (tag_id, language)
+  );
+
+  -- Games somebody chose to hide from a library view. Keyed by who hid them as
+  -- well as whose library it is: the same profile can be looked at by several
+  -- people, and one person's clutter is another's backlog.
+  CREATE TABLE IF NOT EXISTS hidden_games (
+    owner     TEXT NOT NULL,
+    steam_id  TEXT NOT NULL,
+    app_id    INTEGER NOT NULL,
+    name      TEXT NOT NULL,
+    hidden_at INTEGER NOT NULL,
+    PRIMARY KEY (owner, steam_id, app_id)
   );
 
   CREATE TABLE IF NOT EXISTS tracked_games (
@@ -424,16 +444,35 @@ export interface HltbRecord {
   updatedAt: number;
 }
 
-export interface TagRecord {
+export interface HiddenGameRecord {
+  appId: number;
+  /** The name at the time it was hidden, so the list reads without a lookup. */
+  name: string;
+  hiddenAt: number;
+}
+
+interface HiddenGameRow {
+  app_id: number;
+  name: string;
+  hidden_at: number;
+}
+
+export interface StoreDetailsRecord {
   appId: number;
   /** Steam tag IDs, most agreed-upon first. Names are resolved separately. */
   tagIds: number[];
+  /** Null when the store had no review summary for this game. */
+  reviews: StoreReviewSummary | null;
+  /** Capsule image path relative to the store asset host, or null. */
+  capsulePath: string | null;
   updatedAt: number;
 }
 
-interface TagRow {
+interface StoreDetailsRow {
   app_id: number;
   tag_ids: string;
+  reviews: string | null;
+  capsule_path: string | null;
   updated_at: number;
 }
 
@@ -519,12 +558,36 @@ const upsertHltbStmt = db.prepare(`
     updated_at    = excluded.updated_at
 `);
 
-const upsertTagsStmt = db.prepare(`
-  INSERT INTO steam_tags (app_id, tag_ids, updated_at)
-  VALUES (?, ?, ?)
+const selectHiddenGamesStmt = db.prepare<[string, string], HiddenGameRow>(`
+  SELECT app_id, name, hidden_at FROM hidden_games
+  WHERE owner = ? AND steam_id = ?
+  ORDER BY hidden_at DESC, app_id
+`);
+
+// Hiding an already hidden game keeps the original timestamp: the list is
+// ordered by when something was first put away, not by the latest click.
+const insertHiddenGameStmt = db.prepare(`
+  INSERT INTO hidden_games (owner, steam_id, app_id, name, hidden_at)
+  VALUES (?, ?, ?, ?, ?)
+  ON CONFLICT (owner, steam_id, app_id) DO NOTHING
+`);
+
+const deleteHiddenGameStmt = db.prepare(`
+  DELETE FROM hidden_games WHERE owner = ? AND steam_id = ? AND app_id = ?
+`);
+
+const deleteAllHiddenGamesStmt = db.prepare(`
+  DELETE FROM hidden_games WHERE owner = ? AND steam_id = ?
+`);
+
+const upsertStoreDetailsStmt = db.prepare(`
+  INSERT INTO store_details (app_id, tag_ids, reviews, capsule_path, updated_at)
+  VALUES (?, ?, ?, ?, ?)
   ON CONFLICT (app_id) DO UPDATE SET
-    tag_ids    = excluded.tag_ids,
-    updated_at = excluded.updated_at
+    tag_ids      = excluded.tag_ids,
+    reviews      = excluded.reviews,
+    capsule_path = excluded.capsule_path,
+    updated_at   = excluded.updated_at
 `);
 
 const selectTagNamesStmt = db.prepare<[string], TagNameRow>(
@@ -598,7 +661,10 @@ const countHltbStmt = db.prepare<[number], { total: number }>(
 );
 
 /** Chunked lookup for hltb_games, same reasoning as selectPricesStmt above. */
-const selectHltbStmts = new Map<number, Database.Statement<number[], HltbRow>>();
+const selectHltbStmts = new Map<
+  number,
+  Database.Statement<number[], HltbRow>
+>();
 
 function selectHltbStmt(size: number): Database.Statement<number[], HltbRow> {
   let statement = selectHltbStmts.get(size);
@@ -651,7 +717,9 @@ export function getVanityResolution(
   vanity: string,
 ): { steamId: string | null; resolvedAt: number } | undefined {
   const row = selectVanityStmt.get(vanity);
-  return row ? { steamId: row.steam_id, resolvedAt: row.resolved_at } : undefined;
+  return row
+    ? { steamId: row.steam_id, resolvedAt: row.resolved_at }
+    : undefined;
 }
 
 export function setVanityResolution(
@@ -695,7 +763,10 @@ export function getHltbFor(appIds: number[]): Map<number, HltbRecord> {
 }
 
 /** Writes one game's result, matched or not. */
-export function upsertHltb(record: Omit<HltbRecord, "updatedAt">, updatedAt: number): void {
+export function upsertHltb(
+  record: Omit<HltbRecord, "updatedAt">,
+  updatedAt: number,
+): void {
   upsertHltbStmt.run({
     appId: record.appId,
     hltbId: record.hltbId,
@@ -708,32 +779,64 @@ export function upsertHltb(record: Omit<HltbRecord, "updatedAt">, updatedAt: num
   });
 }
 
-/** Chunked lookup for steam_tags, same reasoning as selectHltbStmt above. */
-const selectTagsStmts = new Map<number, Database.Statement<number[], TagRow>>();
+/** Chunked lookup for store_details, same reasoning as selectHltbStmt above. */
+const selectStoreDetailsStmts = new Map<
+  number,
+  Database.Statement<number[], StoreDetailsRow>
+>();
 
-function selectTagsStmt(size: number): Database.Statement<number[], TagRow> {
-  let statement = selectTagsStmts.get(size);
+function selectStoreDetailsStmt(
+  size: number,
+): Database.Statement<number[], StoreDetailsRow> {
+  let statement = selectStoreDetailsStmts.get(size);
   if (!statement) {
     const placeholders = new Array<string>(size).fill("?").join(",");
-    statement = db.prepare<number[], TagRow>(
-      `SELECT * FROM steam_tags WHERE app_id IN (${placeholders})`,
+    statement = db.prepare<number[], StoreDetailsRow>(
+      `SELECT * FROM store_details WHERE app_id IN (${placeholders})`,
     );
-    selectTagsStmts.set(size, statement);
+    selectStoreDetailsStmts.set(size, statement);
   }
   return statement;
 }
 
 /**
- * Reads cached tag IDs. A row whose JSON no longer parses is treated as absent
- * rather than thrown: tags are decoration, and a damaged row should cause a
- * refetch, not a failed library request.
+ * Reads a stored review summary back, checking its shape rather than trusting
+ * it. A damaged value becomes "no summary", never an exception.
  */
-export function getTagsFor(appIds: number[]): Map<number, TagRecord> {
-  const result = new Map<number, TagRecord>();
+function readReviews(json: string | null): StoreReviewSummary | null {
+  if (json === null) return null;
+  try {
+    const parsed = JSON.parse(json) as Partial<StoreReviewSummary> | null;
+    if (!parsed || typeof parsed !== "object") return null;
+    if (typeof parsed.score !== "number" || typeof parsed.count !== "number") {
+      return null;
+    }
+    return {
+      score: parsed.score,
+      percentPositive:
+        typeof parsed.percentPositive === "number"
+          ? parsed.percentPositive
+          : null,
+      count: parsed.count,
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Reads cached store details. A row whose tag JSON no longer parses is treated
+ * as absent rather than thrown: all of this is decoration, and a damaged row
+ * should cause a refetch, not a failed library request.
+ */
+export function getStoreDetailsFor(
+  appIds: number[],
+): Map<number, StoreDetailsRecord> {
+  const result = new Map<number, StoreDetailsRecord>();
   const chunkSize = 400;
   for (let i = 0; i < appIds.length; i += chunkSize) {
     const chunk = appIds.slice(i, i + chunkSize);
-    for (const row of selectTagsStmt(chunk.length).all(...chunk)) {
+    for (const row of selectStoreDetailsStmt(chunk.length).all(...chunk)) {
       let tagIds: number[];
       try {
         const parsed: unknown = JSON.parse(row.tag_ids);
@@ -747,6 +850,8 @@ export function getTagsFor(appIds: number[]): Map<number, TagRecord> {
       result.set(row.app_id, {
         appId: row.app_id,
         tagIds,
+        reviews: readReviews(row.reviews),
+        capsulePath: row.capsule_path,
         updatedAt: row.updated_at,
       });
     }
@@ -754,14 +859,66 @@ export function getTagsFor(appIds: number[]): Map<number, TagRecord> {
   return result;
 }
 
-/** Writes a batch of tag lists. An empty list is a real answer and is stored. */
-export const upsertTags = db.transaction(
-  (records: Array<{ appId: number; tagIds: number[] }>, updatedAt: number) => {
+/**
+ * Writes a batch of store details. An empty tag list and a missing summary are
+ * real answers and are stored as such, so the game is not asked about again
+ * until the record goes stale.
+ */
+export const upsertStoreDetails = db.transaction(
+  (
+    records: Array<{
+      appId: number;
+      tagIds: number[];
+      reviews: StoreReviewSummary | null;
+      capsulePath: string | null;
+    }>,
+    updatedAt: number,
+  ) => {
     for (const record of records) {
-      upsertTagsStmt.run(record.appId, JSON.stringify(record.tagIds), updatedAt);
+      upsertStoreDetailsStmt.run(
+        record.appId,
+        JSON.stringify(record.tagIds),
+        record.reviews ? JSON.stringify(record.reviews) : null,
+        record.capsulePath,
+        updatedAt,
+      );
     }
   },
 );
+
+/** The games one caller has hidden in one library, most recently hidden first. */
+export function getHiddenGames(
+  owner: string,
+  steamId: string,
+): HiddenGameRecord[] {
+  return selectHiddenGamesStmt.all(owner, steamId).map((row) => ({
+    appId: row.app_id,
+    name: row.name,
+    hiddenAt: row.hidden_at,
+  }));
+}
+
+export function hideGame(
+  owner: string,
+  steamId: string,
+  appId: number,
+  name: string,
+  hiddenAt: number,
+): void {
+  insertHiddenGameStmt.run(owner, steamId, appId, name, hiddenAt);
+}
+
+export function unhideGame(
+  owner: string,
+  steamId: string,
+  appId: number,
+): void {
+  deleteHiddenGameStmt.run(owner, steamId, appId);
+}
+
+export function unhideAllGames(owner: string, steamId: string): void {
+  deleteAllHiddenGamesStmt.run(owner, steamId);
+}
 
 export function getTagNames(language: string): Map<number, string> {
   const names = new Map<number, string>();
@@ -810,7 +967,8 @@ export function countDueGames(
   unmatchedBefore: number,
 ): number {
   return (
-    countDueGamesStmt.get(maxFailures, matchedBefore, unmatchedBefore)?.total ?? 0
+    countDueGamesStmt.get(maxFailures, matchedBefore, unmatchedBefore)?.total ??
+    0
   );
 }
 

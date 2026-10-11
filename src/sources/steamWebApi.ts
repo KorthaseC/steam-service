@@ -26,6 +26,7 @@ export type SteamApiErrorCode =
   | "profile_not_found"
   | "profile_private"
   | "library_unavailable"
+  | "game_not_in_library"
   | "steam_rate_limited"
   | "steam_unavailable";
 
@@ -56,6 +57,11 @@ export interface OwnedGame {
   playtimeMinutes: number;
   /** Unix seconds, or null when Steam has never recorded a session. */
   lastPlayed: number | null;
+  /**
+   * Hash naming the game's square community icon, or null when Steam sends
+   * none. Optional because libraries cached before it was read lack it.
+   */
+  iconHash?: string | null;
 }
 
 export function isSteamApiConfigured(): boolean {
@@ -245,6 +251,13 @@ export async function getOwnedGames(steamId: string): Promise<OwnedGame[]> {
 
     const playtime = Number(raw.playtime_forever);
     const lastPlayed = Number(raw.rtime_last_played);
+    // Only a plain SHA-1 hex string is accepted: the value becomes part of an
+    // image URL, so anything else is dropped rather than interpolated.
+    const iconHash =
+      typeof raw.img_icon_url === "string" &&
+      /^[0-9a-f]{40}$/i.test(raw.img_icon_url)
+        ? raw.img_icon_url.toLowerCase()
+        : null;
 
     result.push({
       appId,
@@ -252,6 +265,7 @@ export async function getOwnedGames(steamId: string): Promise<OwnedGame[]> {
       playtimeMinutes: Number.isFinite(playtime) && playtime > 0 ? playtime : 0,
       lastPlayed:
         Number.isFinite(lastPlayed) && lastPlayed > 0 ? lastPlayed : null,
+      iconHash,
     });
   }
 

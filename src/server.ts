@@ -57,6 +57,16 @@ const server = app.listen(config.port, config.host, () => {
   console.log(
     `[server] currency ${config.currency}, ${config.guestKeys.size} guest key(s) configured`,
   );
+  // Labels only, never the codes. Environment values are read once at start,
+  // so this line is the quickest way to confirm that a changed ACCESS_CODES
+  // actually reached the running process.
+  console.log(
+    config.accessCodes.size > 0
+      ? `[server] login enabled, ${config.accessCodes.size} access code(s): ${[
+          ...config.accessCodes.values(),
+        ].join(", ")}`
+      : "[server] login disabled, no access codes configured",
+  );
 });
 
 const priceTimer = startPriceWorker();
@@ -64,10 +74,13 @@ const hltbTimer = startHltbWorker();
 
 // Cached snapshots older than a day are of no use to anybody. Libraries are
 // kept a week: they change slowly and refetching one costs a Web API call.
-const pruneTimer = setInterval(() => {
-  pruneInventoryCache(24 * 60 * 60 * 1000);
-  pruneLibraryCache(7 * 24 * 60 * 60 * 1000);
-}, 60 * 60 * 1000);
+const pruneTimer = setInterval(
+  () => {
+    pruneInventoryCache(24 * 60 * 60 * 1000);
+    pruneLibraryCache(7 * 24 * 60 * 60 * 1000);
+  },
+  60 * 60 * 1000,
+);
 pruneTimer.unref();
 
 function shutdown(signal: string): void {

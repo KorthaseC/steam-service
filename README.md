@@ -7,8 +7,8 @@ process, one database and one deployment:
   Market prices from a local cache. Ships with an example Google Apps Script
   client so a spreadsheet can pull live prices into a buy/sell log.
 - **Library and completion times** — resolves a Steam profile, lists the games
-  it owns, and matches them against HowLongToBeat, so the question *"I have
-  eight hours, which of my games can I actually finish?"* has an answer. This is
+  it owns, and matches them against HowLongToBeat, so the question _"I have
+  eight hours, which of my games can I actually finish?"_ has an answer. This is
   the backend for the Steam Expander Overviewer web frontend, which lives in its
   own repository.
 
@@ -76,7 +76,7 @@ does instead is what their own web app does, verified against the live site:
 
 1. `GET /api/search/site/init` returns `{ token, hpKey, hpVal }`.
 2. `POST /api/search/site` sends that token as `x-auth-token`, the `hpKey` and
-   `hpVal` pair as *both* headers and a field inside the JSON body — sending it
+   `hpVal` pair as _both_ headers and a field inside the JSON body — sending it
    in only one of the two places is rejected — and gets back search results.
 3. A `403` means the token expired: fetch a new one and retry once.
 
@@ -98,14 +98,14 @@ times. Matching therefore runs cheapest-first and only escalates when unsure:
    strips `™`/`®` **before** Unicode normalisation, which would otherwise expand
    `™` into the letters `TM` and turn `PAYDAY™ 2` into `paydaytm 2`.
 2. The same comparison with edition wording removed, since Steam writes
-   *Skyrim Special Edition* where HowLongToBeat writes *Skyrim*. Only a second
-   attempt, because *Remastered* can be a genuinely separate entry.
+   _Skyrim Special Edition_ where HowLongToBeat writes _Skyrim_. Only a second
+   attempt, because _Remastered_ can be a genuinely separate entry.
 3. Still ambiguous: fetch the candidate's detail page and compare its
    `profile_steam` field against the Steam AppID. That is authoritative. Capped
    at two candidates so an unmatchable library cannot triple the request volume.
 
 In practice nearly everything resolves at step 1 for a single request per game.
-A game that resolves to nothing is cached as *unmatched* — remembering the miss
+A game that resolves to nothing is cached as _unmatched_ — remembering the miss
 is what stops a library full of multiplayer titles from being searched forever.
 
 ### Why the times arrive late
@@ -117,18 +117,21 @@ records those games, and a background worker fills them in — the same
 demand-driven shape as pricing. The frontend polls until nothing is pending.
 At the default settings a 500-game library completes in roughly 25 minutes.
 
-### Why the tags do not
+### Why the store details do not
 
-Store tags look like a second case of the same problem and are not one. They
-come from the API the Steam store front-end itself calls, which answers **200
-AppIDs in about half a second** — a 500-game library is three requests and
-roughly a second and a half, so tags are resolved inside the library request
-with no worker, no queue and nothing to poll.
+Store tags, review summaries and capsule image paths look like a second case of
+the same problem and are not one. All three come from a single call to the API
+the Steam store front-end itself uses, which answers **200 AppIDs in about half
+a second** — a 500-game library is three requests and roughly a second and a
+half, so they are resolved inside the library request with no worker, no queue
+and nothing to poll.
 
 The endpoint is undocumented and needs no API key. That combination argues for
-treating tags as a garnish everywhere: a failure empties the field and is
-logged, but never fails the library request, and `STORE_TAGS_ENABLED=false`
-turns the whole thing off with the same visible result. Tag names are localised
+treating everything from it as a garnish: a failure empties tags and reviews,
+falls back to derived image URLs and is logged, but never fails the library
+request, and `STORE_TAGS_ENABLED=false` turns the whole thing off with the same
+visible result. Records are refreshed at the shorter of `STORE_TAG_MAX_AGE_DAYS`
+and `STORE_REVIEW_MAX_AGE_DAYS`, since both parts arrive together. Tag names are localised
 and cached per language; the vocabulary is one 16 kB request for about 450
 tags, refreshed monthly and skipped entirely when Steam's `version_hash` has
 not moved.
@@ -137,6 +140,23 @@ It is GET-only, and the request is a JSON blob in a query parameter, so the
 batch ceiling is URL length rather than a documented item count: 240 AppIDs
 still answer, 300 come back `414 URI Too Long`. `STORE_TAG_BATCH_SIZE` defaults
 to 200 and is clamped to 240 in code.
+
+### Why images need the store lookup
+
+The obvious capsule URL, `store_item_assets/steam/apps/<appid>/capsule_231x87.jpg`,
+only exists for older store art. Art uploaded or replaced more recently lives
+below a content hash — `steam/apps/<appid>/<hash>/capsule_231x87.jpg` — and the
+AppID-derived URL returns a 404 for those games, which is most of what was
+released in the last couple of years. The hash cannot be derived; the store
+lookup reports it in `assets.asset_url_format` plus a filename.
+
+`capsuleUrl` therefore uses the reported path when there is one and the derived
+URL otherwise. A game that has left the store usually has neither, so each game
+also carries `iconUrl`, the square community icon addressed by the hash
+`GetOwnedGames` sends. The frontend walks that chain on image errors. Reported
+paths are validated strictly before use — relative, image extension, no `..`,
+no scheme — and stored relative to `STORE_ASSET_BASE`, so a move of the asset
+host is a configuration change rather than a refetch.
 
 ## How a request flows
 
@@ -164,12 +184,16 @@ GET /api/steam/library/:ref
   |- parse       :ref -> SteamID64 or vanity name, anything else refused
   |- resolve     vanity -> SteamID64 via the Web API, cached both ways
   |              (a remembered miss stops a typo hitting Steam every reload)
+  |- refresh     ?refresh=1 and outside the per-SteamID cooldown?
+  |              -> skip the profile and library caches below
   |- profile     SQLite cache hit? -> use it, otherwise GetPlayerSummaries
+  |              (public: PROFILE_CACHE_MINUTES, private: seconds only)
   |              private profile -> 403 before any library call happens
   |- library     SQLite cache hit? -> use it, otherwise GetOwnedGames
   |- tracking    every AppID is recorded for the completion-time worker
   |- times       bulk SELECT from hltb_games; unknown games stay null
-  |- tags        cached tag IDs; missing ones fetched now, 200 AppIDs a request
+  |- store       cached tags, reviews, image paths; missing ones fetched now,
+  |              200 AppIDs a request
   |              (failure here empties the field, it never fails the request)
   |- kick        worker started in the background if anything is pending
   |- JSON response, immediately
@@ -271,52 +295,57 @@ backend with `COOKIE_SECURE=false`. `docs/backend-contract.md` has the config.
 Every option is set through the environment; `.env.example` documents all of
 them. The ones you are most likely to change:
 
-| Variable                         | Default    | Purpose                                                          |
-| -------------------------------- | ---------- | ---------------------------------------------------------------- |
-| `ADMIN_KEY`                      | _required_ | Full access. Minimum 32 characters.                              |
-| `GUEST_KEYS`                     | empty      | `key:label,key:label`. Each key >= 24 characters, labels unique. |
-| `CURRENCY`                       | `EUR`      | `EUR` or `USD`. Steam returns it directly, nothing is converted. |
-| `PRICE_REFRESH_MINUTES`          | `60`       | How often the background cycle runs.                             |
-| `PRICE_MAX_AGE_HOURS`            | `12`       | A price older than this is queued for refresh.                   |
-| `PRICE_REFRESH_BATCH`            | `150`      | Lookups per cycle. At 4s each, roughly ten minutes.              |
-| `MAX_LOOKUP_FAILURES`            | `5`        | Failures in a row before a name leaves the queue.                |
-| `TRACKED_RETENTION_DAYS`         | `30`       | Names nobody asked about are forgotten.                          |
-| `STEAM_FALLBACK_DELAY_MS`        | `4000`     | Delay between direct Steam lookups.                              |
-| `STEAM_FALLBACK_MAX_PER_REQUEST` | `15`       | Lookups a single request may trigger.                            |
-| `STEAM_USER_AGENT`               | Chrome 124 | See _Talking to Steam_.                                          |
-| `STEAM_SEC_CH_UA`                | Chrome 124 | Must match the user agent's major version.                       |
-| `INVENTORY_PAGE_SIZE`            | `75`       | Items per inventory page.                                        |
-| `INVENTORY_MAX_PAGES`            | `40`       | Page size × this is the item ceiling.                            |
-| `INVENTORY_CACHE_MINUTES`        | `10`       | Raise this if Steam starts blocking you.                         |
-| `STEAM_FEE_DIVISOR`              | `1.15`     | Net proceeds = price / this value.                               |
-| `IP_RATE_MAX`                    | `300`      | Requests per address before auth. Keep above per-key limits.     |
-| `GUEST_RATE_MAX`                 | `20`       | Guest requests per rate-limit window.                            |
-| `ENABLE_HISTORY`                 | `true`     | Store one price point per item per day.                          |
-| `STEAM_API_KEY`                  | empty      | Web API key. Empty disables the library endpoints (503).         |
-| `ACCESS_CODES`                   | empty      | `code:label,…` for the frontend login. Each >= 12 characters.    |
-| `SESSION_SECRET`                 | empty      | Cookie signing key, >= 32 characters. Required with access codes.|
-| `SESSION_TTL_DAYS`               | `30`       | Cookie lifetime.                                                 |
-| `COOKIE_SECURE`                  | `true`     | Only false for local development over plain http.                |
-| `LOGIN_RATE_MAX`                 | `10`       | Login attempts per address per 15 minutes.                       |
-| `SESSION_RATE_MAX`               | `120`      | Requests per signed-in browser per window.                       |
-| `LIBRARY_CACHE_MINUTES`          | `60`       | Libraries change slowly; this saves Web API calls.               |
-| `HLTB_ENABLED`                   | `true`     | Emergency switch for all HowLongToBeat traffic.                  |
-| `HLTB_BATCH_SIZE`                | `40`       | Games per worker cycle. Batch × delay should fit the interval.   |
-| `HLTB_DELAY_MS`                  | `3000`     | Delay between HowLongToBeat requests.                            |
-| `HLTB_MAX_AGE_DAYS`              | `90`       | Completion times barely change.                                  |
-| `STORE_TAGS_ENABLED`             | `true`     | Emergency switch for all store tag traffic.                      |
-| `STORE_TAG_LANGUAGE`             | `german`   | Tag names are localised and cached per language.                 |
-| `STORE_TAGS_PER_GAME`            | `6`        | Top N tags, in Steam's own agreement order.                      |
-| `STORE_TAG_BATCH_SIZE`           | `200`      | AppIDs per request. Clamped to 240: above that Steam answers 414.|
-| `STORE_TAG_MAX_AGE_DAYS`         | `30`       | Tags drift slowly; a game does not change genre.                 |
-| `STORE_TAG_BUDGET_MS`            | `8000`     | Time tags may spend in one request before the rest waits.        |
+| Variable                           | Default    | Purpose                                                            |
+| ---------------------------------- | ---------- | ------------------------------------------------------------------ |
+| `ADMIN_KEY`                        | _required_ | Full access. Minimum 32 characters.                                |
+| `GUEST_KEYS`                       | empty      | `key:label,key:label`. Each key >= 24 characters, labels unique.   |
+| `CURRENCY`                         | `EUR`      | `EUR` or `USD`. Steam returns it directly, nothing is converted.   |
+| `PRICE_REFRESH_MINUTES`            | `60`       | How often the background cycle runs.                               |
+| `PRICE_MAX_AGE_HOURS`              | `12`       | A price older than this is queued for refresh.                     |
+| `PRICE_REFRESH_BATCH`              | `150`      | Lookups per cycle. At 4s each, roughly ten minutes.                |
+| `MAX_LOOKUP_FAILURES`              | `5`        | Failures in a row before a name leaves the queue.                  |
+| `TRACKED_RETENTION_DAYS`           | `30`       | Names nobody asked about are forgotten.                            |
+| `STEAM_FALLBACK_DELAY_MS`          | `4000`     | Delay between direct Steam lookups.                                |
+| `STEAM_FALLBACK_MAX_PER_REQUEST`   | `15`       | Lookups a single request may trigger.                              |
+| `STEAM_USER_AGENT`                 | Chrome 124 | See _Talking to Steam_.                                            |
+| `STEAM_SEC_CH_UA`                  | Chrome 124 | Must match the user agent's major version.                         |
+| `INVENTORY_PAGE_SIZE`              | `75`       | Items per inventory page.                                          |
+| `INVENTORY_MAX_PAGES`              | `40`       | Page size × this is the item ceiling.                              |
+| `INVENTORY_CACHE_MINUTES`          | `10`       | Raise this if Steam starts blocking you.                           |
+| `STEAM_FEE_DIVISOR`                | `1.15`     | Net proceeds = price / this value.                                 |
+| `IP_RATE_MAX`                      | `300`      | Requests per address before auth. Keep above per-key limits.       |
+| `GUEST_RATE_MAX`                   | `20`       | Guest requests per rate-limit window.                              |
+| `ENABLE_HISTORY`                   | `true`     | Store one price point per item per day.                            |
+| `STEAM_API_KEY`                    | empty      | Web API key. Empty disables the library endpoints (503).           |
+| `ACCESS_CODES`                     | empty      | `code:label,…` for the frontend login. Each >= 12 characters.      |
+| `SESSION_SECRET`                   | empty      | Cookie signing key, >= 32 characters. Required with access codes.  |
+| `SESSION_TTL_DAYS`                 | `30`       | Cookie lifetime.                                                   |
+| `COOKIE_SECURE`                    | `true`     | Only false for local development over plain http.                  |
+| `LOGIN_RATE_MAX`                   | `10`       | Login attempts per address per 15 minutes.                         |
+| `SESSION_RATE_MAX`                 | `120`      | Requests per signed-in browser per window.                         |
+| `LIBRARY_CACHE_MINUTES`            | `60`       | Libraries change slowly; this saves Web API calls.                 |
+| `PRIVATE_PROFILE_CACHE_SECONDS`    | `20`       | How long a private profile stays cached as private.                |
+| `LIBRARY_REFRESH_COOLDOWN_SECONDS` | `60`       | Minimum gap between two `?refresh=1` for the same SteamID.         |
+| `HLTB_ENABLED`                     | `true`     | Emergency switch for all HowLongToBeat traffic.                    |
+| `HLTB_BATCH_SIZE`                  | `40`       | Games per worker cycle. Batch × delay should fit the interval.     |
+| `HLTB_DELAY_MS`                    | `3000`     | Delay between HowLongToBeat requests.                              |
+| `HLTB_MAX_AGE_DAYS`                | `90`       | Completion times barely change.                                    |
+| `STORE_TAGS_ENABLED`               | `true`     | Emergency switch for store tags, reviews and image paths.          |
+| `STORE_TAG_LANGUAGE`               | `german`   | Tag names are localised and cached per language.                   |
+| `STORE_TAGS_PER_GAME`              | `6`        | Top N tags, in Steam's own agreement order.                        |
+| `STORE_TAG_BATCH_SIZE`             | `200`      | AppIDs per request. Clamped to 240: above that Steam answers 414.  |
+| `STORE_TAG_MAX_AGE_DAYS`           | `30`       | Tags drift slowly; a game does not change genre.                   |
+| `STORE_TAG_BUDGET_MS`              | `8000`     | Time store details may spend in one request before the rest waits. |
+| `STORE_REVIEW_MAX_AGE_DAYS`        | `7`        | Review summaries move faster than tags; shorter limit wins.        |
+| `STORE_ASSET_BASE`                 | fastly     | Host for the image paths the store lookup reports.                 |
+| `STEAM_COMMUNITY_ICON_BASE`        | media      | Host for square community icons, the last image fallback.          |
 
 Invalid or missing critical values abort startup rather than failing later at
 request time. Two exceptions are deliberate: `STEAM_API_KEY` and
 `ACCESS_CODES`/`SESSION_SECRET` may be absent, in which case the corresponding
 endpoints answer `503 feature_disabled` and everything else keeps working — so
 an existing deployment still boots after an update without new configuration.
-Setting `ACCESS_CODES` *without* a long `SESSION_SECRET` is a configuration
+Setting `ACCESS_CODES` _without_ a long `SESSION_SECRET` is a configuration
 error and does abort startup, because it would hand out cookies nobody can
 verify.
 
@@ -328,21 +357,24 @@ _Security model_ first.
 
 The browser frontend authenticates differently — see _Sessions_ below.
 
-| Method | Path                            | Access  | Purpose                                        |
-| ------ | ------------------------------- | ------- | ---------------------------------------------- |
-| GET    | `/api/health`                   | open    | Liveness and cache state                       |
-| GET    | `/api/inventory/:steamId`       | guest   | Value a public inventory                       |
-| GET    | `/api/portfolio/:steamId`       | admin   | Same data, plus `?format=csv` and `?refresh=1` |
-| POST   | `/api/prices/lookup`            | admin   | Prices for a list of names (max 500)           |
-| POST   | `/api/admin/refresh-prices`     | admin   | Run a refresh cycle now                        |
-| GET    | `/api/admin/status`             | admin   | Cache, tracking and queue state                |
-| POST   | `/api/auth/session`             | open    | Trade an access code for a session cookie      |
-| GET    | `/api/auth/session`             | open    | Whether the caller is signed in                |
-| DELETE | `/api/auth/session`             | open    | Sign out                                       |
-| GET    | `/api/steam/library/:ref`       | guest   | Profile, owned games, cached completion times  |
-| GET    | `/api/steam/library/:ref/hltb`  | guest   | Completion times only, for polling             |
-| GET    | `/api/steam/status`             | admin   | Completion-time worker progress                |
-| POST   | `/api/admin/refresh-hltb`       | admin   | Run a completion-time cycle now                |
+| Method | Path                                    | Access | Purpose                                          |
+| ------ | --------------------------------------- | ------ | ------------------------------------------------ |
+| GET    | `/api/health`                           | open   | Liveness and cache state                         |
+| GET    | `/api/inventory/:steamId`               | guest  | Value a public inventory                         |
+| GET    | `/api/portfolio/:steamId`               | admin  | Same data, plus `?format=csv` and `?refresh=1`   |
+| POST   | `/api/prices/lookup`                    | admin  | Prices for a list of names (max 500)             |
+| POST   | `/api/admin/refresh-prices`             | admin  | Run a refresh cycle now                          |
+| GET    | `/api/admin/status`                     | admin  | Cache, tracking and queue state                  |
+| POST   | `/api/auth/session`                     | open   | Trade an access code for a session cookie        |
+| GET    | `/api/auth/session`                     | open   | Whether the caller is signed in                  |
+| DELETE | `/api/auth/session`                     | open   | Sign out                                         |
+| GET    | `/api/steam/library/:ref`               | guest  | Profile, owned games, cached times; `?refresh=1` |
+| GET    | `/api/steam/library/:ref/hltb`          | guest  | Completion times only, for polling               |
+| PUT    | `/api/steam/library/:ref/hidden/:appId` | guest  | Hide a game for this caller                      |
+| DELETE | `/api/steam/library/:ref/hidden/:appId` | guest  | Show a hidden game again                         |
+| DELETE | `/api/steam/library/:ref/hidden`        | guest  | Show every hidden game again                     |
+| GET    | `/api/steam/status`                     | admin  | Completion-time worker progress                  |
+| POST   | `/api/admin/refresh-hltb`               | admin  | Run a completion-time cycle now                  |
 
 `docs/backend-contract.md` documents the library endpoints in full — request
 shapes, response shapes, error codes and polling behaviour. That file is the one
@@ -409,6 +441,50 @@ Error codes: `invalid_steamid`, `inventory_private`, `inventory_empty`,
 profile is public but its **game details** are private, which is a separate
 Steam privacy setting and defaults to private for many accounts.
 
+### Hidden games
+
+Somebody looking at a library can hide games they never want to see in it
+again. The list lives in SQLite (`hidden_games`), keyed by the label of the
+access code or guest key and by the library's SteamID, so it follows a person
+across devices and each viewer of a profile keeps their own. People who share
+an access code share the list — there are no accounts to tell them apart.
+
+Hidden games are removed before anything else happens to a library: they are
+not tracked for completion times, not looked up in the store, and not counted
+in `hltb` or `tags`, so they can never be the reason a progress bar is still
+running. The response lists them separately under `hidden`.
+
+The hide endpoints only accept a game that is part of the library, and store
+the server's copy of its name. They are state-changing endpoints on a cookie
+session; the cookie is `SameSite=Lax` and the API sends no CORS headers, so a
+cross-site page cannot trigger them.
+
+### After a privacy change
+
+The usual next step after `profile_private` or `library_unavailable` is to fix
+the setting and try again, so neither outcome is allowed to linger in a cache:
+
+- A **private profile** is remembered for `PRIVATE_PROFILE_CACHE_SECONDS` (20 by
+  default), not for `PROFILE_CACHE_MINUTES`. Public profiles keep the long
+  lifetime; they are the ones that barely change.
+- **Private game details** are never cached at all: the error is raised before
+  anything is written, so the next request asks Steam again.
+- A **cached library** that is out of date for privacy reasons, typically every
+  playtime reading 0 because "keep my total playtime private" was still ticked,
+  is replaced by `GET /api/steam/library/:ref?refresh=1`. That skips the
+  profile and library caches, at most once per
+  `LIBRARY_REFRESH_COOLDOWN_SECONDS` per SteamID; inside the window the request
+  is answered from the cache as usual. `meta.refreshAvailableInSeconds` in
+  the response says how long until the next forced refresh is honoured.
+
+The cooldown is kept in memory, keyed by SteamID rather than by caller, so it
+bounds Web API usage no matter how many people press the button — and a
+restart only ever allows one refresh early.
+
+What none of this controls is Steam itself: the Web API does not always reflect
+a privacy change immediately, so a correct setting can still be refused for a
+short while.
+
 ### Sessions
 
 The web frontend cannot hold a bearer key — anything a page stores is readable
@@ -425,6 +501,13 @@ curl -b jar https://prices.example.com/api/steam/library/gaben
 A session counts as guest access, so it also opens `/api/inventory/:steamId` —
 which is what makes it cheap to show inventory values in the frontend later.
 Admin endpoints are bearer-only and a cookie never reaches them.
+
+Access codes are read from the environment once, at startup. After adding or
+changing one, restart the service; the startup log names the labels it loaded
+(`[server] login enabled, 2 access code(s): chris, anna`), which is the quickest
+check that the edit reached the running process. All codes belong on a single
+`ACCESS_CODES` line - a second line replaces the first rather than extending
+it.
 
 The cookie is self-contained: it carries its own expiry inside the signature, so
 there is no session table. The flip side is that individual sessions cannot be
@@ -450,7 +533,7 @@ intended lever.
   own expiry inside the signature.
 - **Access codes are shorter than guest keys** — 12 characters against 24 —
   because a person types them. That is a real trade-off, paid for by a dedicated
-  login limiter of 10 attempts per 15 minutes per address, applied *before* the
+  login limiter of 10 attempts per 15 minutes per address, applied _before_ the
   comparison. If you expose this to the open internet rather than to a handful
   of friends, raise the minimum in `parseAccessCodes` and issue longer codes.
 - **Cookies never reach admin endpoints.** `requireAdmin` reads bearer keys
@@ -530,13 +613,17 @@ listed after each run.
   ambiguous. A game whose Steam and HowLongToBeat names differ in an unusual way
   can end up unmatched rather than wrong, which is the intended failure
   direction.
-- The store tag lookup is likewise undocumented, and unlike the price and
-  completion-time paths it needs no API key at all. When it breaks, games come
-  back with empty tag lists and the response says so in `tags.known`; nothing
-  else is affected. `STORE_TAGS_ENABLED=false` produces the same result on
-  purpose.
+- The store lookup for tags, reviews and image paths is likewise undocumented,
+  and unlike the price and completion-time paths it needs no API key at all.
+  When it breaks, games come back with empty tag lists, no review summary and
+  AppID-derived image URLs — which 404 for newer store art — and the response
+  says so in `tags.known`; nothing else is affected. `STORE_TAGS_ENABLED=false`
+  produces the same result on purpose.
+- Review summaries are Steam's own verdict and percentage, refreshed weekly by
+  default. A game with few reviews has a score of 0 rather than a verdict.
 - Reading a library needs the account's **game details** to be public, which is
-  a different Steam setting from the profile being public.
+  a different Steam setting from the profile being public. After changing it,
+  the Web API may take a little while to agree; that delay is Steam's.
 - The Steam Web API allows 100,000 calls per day per key. Libraries are cached
   for an hour, so this is not a practical limit for a handful of users.
 
@@ -553,18 +640,19 @@ src/
   throttle.ts          Serialised request queue with a circuit breaker
   prices.ts            Price cache: refresh cycle, lookups, fee maths
   hltb.ts              Completion-time cache: refresh cycle and worker
-  storeTags.ts         Store tag cache and vocabulary; fails quietly by design
+  storeDetails.ts      Store tags, reviews, image paths; fails quietly by design
   steamHeaders.ts      The client identity every steamcommunity request sends
   steamInventory.ts    Inventory fetch, pagination, aggregation, cache
   steamLibrary.ts      Profile + owned games + cached times, and the caches
   steamRef.ts          Parses user input into a SteamID64 or vanity name
+  refreshCooldown.ts   Per-key cooldown that rations forced library refreshes
   valuation.ts         Inventory x prices -> totals, plus CSV output
   cli-refresh.ts       Seed and refresh from the command line
   sources/
     steamMarket.ts     Throttled priceoverview lookups
     steamWebApi.ts     ResolveVanityURL, GetPlayerSummaries, GetOwnedGames
     howLongToBeat.ts   Token flow, search, and title matching
-    steamStore.ts      Batched store tag lookups and the tag vocabulary
+    steamStore.ts      Batched store lookups (tags, reviews, image paths), tag vocabulary
   *.test.ts            Unit tests for the pure parts (node:test)
 apps-script/Code.gs    Example Google Sheets client
 deploy/                systemd unit
@@ -579,9 +667,10 @@ npm test        # node:test via tsx, no extra dependency
 npm run typecheck
 ```
 
-Covered: the input parser, session cookie signing and verification, and title
-normalisation — the pure parts, where a mistake is silent. Network code is not
-covered, which matches how the rest of this project is verified: by running it.
+Covered: the input parser, session cookie signing and verification, the
+refresh cooldown, store response parsing, and title normalisation — the pure
+parts, where a mistake is silent. Network code is not covered, which matches how
+the rest of this project is verified: by running it.
 
 ## License
 
